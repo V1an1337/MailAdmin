@@ -9,7 +9,9 @@ import re
 import secrets
 import sqlite3
 import string
+import threading
 import time
+import webbrowser
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 
@@ -18,6 +20,7 @@ from flask import (
     Flask,
     abort,
     flash,
+    jsonify,
     redirect,
     render_template_string,
     request,
@@ -355,8 +358,8 @@ INDEX_TEMPLATE = """
         </div>
       </div>
       <div style="display:flex; gap:8px; flex-wrap: wrap;">
-        <a class="btn secondary small" href="{{ url_for('view_mailbox', mailbox_id=box['id']) }}">Inbox</a>
-        <form method="post" action="{{ url_for('delete_mailbox', mailbox_id=box['id']) }}">
+        <a class="btn secondary small" href="{{ url_for('view_mailbox', address=box['address']) }}">Inbox</a>
+        <form method="post" action="{{ url_for('delete_mailbox', address=box['address']) }}">
           <button class="btn ghost small" type="submit">Delete</button>
         </form>
       </div>
@@ -432,7 +435,7 @@ MAILBOX_TEMPLATE = """
   {% else %}
     <div class="message-list">
       {% for msg in messages %}
-      <a class="message-item" href="{{ url_for('view_message', mailbox_id=mailbox['id'], uid=msg['uid'], folder=msg['folder']) }}">
+      <a class="message-item" href="{{ url_for('view_message', address=mailbox['address'], uid=msg['uid'], folder=msg['folder']) }}">
         <div>
           <div class="message-subject">{{ msg['subject'] or '(No subject)' }}</div>
           <div class="message-meta">{{ msg['mail_from'] }} | {{ msg['mail_dt'] }} | {{ msg['folder_label'] }}</div>
@@ -458,10 +461,10 @@ MESSAGE_TEMPLATE = """
     Folder: {{ message['folder_label'] or '-' }}
   </div>
   <div style="display:flex; gap:8px; flex-wrap: wrap; margin-top: 12px;">
-    <form method="post" action="{{ url_for('share_message', mailbox_id=mailbox['id'], uid=message['uid'], folder=message['folder']) }}">
+    <form method="post" action="{{ url_for('share_message', address=mailbox['address'], uid=message['uid'], folder=message['folder']) }}">
       <button class="btn secondary small" type="submit">Create share link</button>
     </form>
-    <a class="btn ghost small" href="{{ url_for('view_mailbox', mailbox_id=mailbox['id']) }}">Back</a>
+    <a class="btn ghost small" href="{{ url_for('view_mailbox', address=mailbox['address']) }}">Back</a>
   </div>
 </div>
 <div class="card" style="margin-top: 16px;">
@@ -542,6 +545,22 @@ def render_page(title, template, **context):
     return render_template_string(
         BASE_TEMPLATE, title=title, content=content, active=active
     )
+
+
+def api_ok(data=None, status=200):
+    payload = {"ok": True, "data": data}
+    return jsonify(payload), status
+
+
+def api_error(message, status=400):
+    payload = {"ok": False, "error": message}
+    return jsonify(payload), status
+
+
+def row_to_dict(row):
+    if row is None:
+        return None
+    return dict(row)
 
 
 def format_ts(ts):
@@ -884,6 +903,200 @@ def shares_page():
     )
 
 
+@APP.get("/api/health")
+def api_health():
+    return api_ok({"status": "ok", "time": int(time.time())})
+
+
+@APP.get("/api/mailboxes")
+def api_list_mailboxes():
+    with get_db() as conn:
+        mailboxes = conn.execute(
+            "SELECT * FROM mailboxes ORDER BY created_at DESC"
+        ).fetchall()
+    payload = [row_to_dict(row) for row in mailboxes]
+    return api_ok(payload)
+
+
+@APP.post("/api/mailboxes")
+def api_import_mailboxes():
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    entries = []
+    errors = []
+    if isinstance(items, list):
+        for idx, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                errors.append(f"Item {idx}: expected object.")
+                continue
+            address = (item.get("address") or "").strip()
+            password = (item.get("password") or "").strip()
+            client_id = (item.get("client_id") or "").strip()
+            refresh_token = (item.get("refresh_token") or item.get("token") or "").strip()
+            if not address:
+                errors.append(f"Item {idx}: address missing.")
+                continue
+            entries.append((address, password, client_id, refresh_token))
+    else:
+        payload = request.form.get("payload")
+        if payload is None:
+            payload = request.get_data(as_text=True) or ""
+        entries, errors = parse_import_payload(payload)
+
+    if errors and not entries:
+        return api_error({"errors": errors}, status=400)
+
+    now = int(time.time())
+    imported = 0
+    with get_db() as conn:
+        for address, password, client_id, refresh_token in entries:
+            existing = conn.execute(
+                "SELECT id FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE mailboxes
+                    SET password = ?, client_id = ?, refresh_token = ?, updated_at = ?
+                    WHERE address = ?
+                    """,
+                    (password, client_id, refresh_token, now, address),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO mailboxes (address, password, client_id, refresh_token, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (address, password, client_id, refresh_token, now, now),
+                )
+            imported += 1
+    return api_ok({"imported": imported, "errors": errors})
+
+
+@APP.delete("/api/mailboxes/<path:address>")
+def api_delete_mailbox(address):
+    with get_db() as conn:
+        conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
+    return api_ok({"deleted": address})
+
+
+@APP.get("/api/mailboxes/<path:address>/messages")
+def api_list_messages(address):
+    limit_raw = request.args.get("limit", str(DEFAULT_LIMIT))
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = DEFAULT_LIMIT
+    limit = max(1, min(MAX_LIMIT, limit))
+    with get_db() as conn:
+        mailbox = conn.execute(
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
+        ).fetchone()
+    if not mailbox:
+        return api_error("Mailbox not found.", status=404)
+    try:
+        messages = list_messages(mailbox, limit)
+    except MailError as exc:
+        return api_error(str(exc), status=500)
+    payload = []
+    for msg in messages:
+        payload.append(
+            {
+                "uid": msg.get("uid"),
+                "subject": msg.get("subject"),
+                "mail_from": msg.get("mail_from"),
+                "mail_to": msg.get("mail_to"),
+                "mail_dt": msg.get("mail_dt"),
+                "mail_ts": msg.get("mail_ts"),
+                "folder": msg.get("folder"),
+                "folder_label": msg.get("folder_label"),
+            }
+        )
+    return api_ok(payload)
+
+
+@APP.get("/api/mailboxes/<path:address>/message/<uid>")
+def api_get_message(address, uid):
+    with get_db() as conn:
+        mailbox = conn.execute(
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
+        ).fetchone()
+    if not mailbox:
+        return api_error("Mailbox not found.", status=404)
+    folder = request.args.get("folder")
+    try:
+        message = fetch_message(mailbox, uid, folder=folder)
+    except MailError as exc:
+        return api_error(str(exc), status=500)
+    message["safe_body_html"] = sanitize_html(message["body_html"])
+    return api_ok(message)
+
+
+@APP.post("/api/mailboxes/<path:address>/message/<uid>/share")
+def api_share_message(address, uid):
+    with get_db() as conn:
+        mailbox = conn.execute(
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
+        ).fetchone()
+    if not mailbox:
+        return api_error("Mailbox not found.", status=404)
+    folder = request.args.get("folder")
+    try:
+        message = fetch_message(mailbox, uid, folder=folder)
+    except MailError as exc:
+        return api_error(str(exc), status=500)
+
+    with get_db() as conn:
+        code = generate_share_code(conn)
+        conn.execute(
+            """
+            INSERT INTO shares (code, subject, mail_from, mail_to, mail_dt, body_html, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code,
+                message["subject"],
+                message["mail_from"],
+                message["mail_to"],
+                message["mail_dt"],
+                build_share_body(message),
+                int(time.time()),
+            ),
+        )
+
+    share_url = request.host_url.rstrip("/") + url_for("view_share", code=code)
+    return api_ok({"code": code, "url": share_url})
+
+
+@APP.get("/api/shares")
+def api_list_shares():
+    with get_db() as conn:
+        shares = conn.execute(
+            "SELECT * FROM shares ORDER BY created_at DESC"
+        ).fetchall()
+    payload = [row_to_dict(row) for row in shares]
+    return api_ok(payload)
+
+
+@APP.get("/api/shares/<code>")
+def api_get_share(code):
+    with get_db() as conn:
+        share = conn.execute(
+            "SELECT * FROM shares WHERE code = ?", (code,)
+        ).fetchone()
+    if not share:
+        return api_error("Share not found.", status=404)
+    return api_ok(row_to_dict(share))
+
+
+@APP.delete("/api/shares/<code>")
+def api_delete_share(code):
+    with get_db() as conn:
+        conn.execute("DELETE FROM shares WHERE code = ?", (code,))
+    return api_ok({"deleted": code})
+
+
 @APP.post("/import")
 def import_mailboxes():
     payload = request.form.get("payload", "").strip()
@@ -929,16 +1142,16 @@ def import_mailboxes():
     return redirect(url_for("import_page"))
 
 
-@APP.post("/mailbox/<int:mailbox_id>/delete")
-def delete_mailbox(mailbox_id):
+@APP.post("/mailbox/<path:address>/delete")
+def delete_mailbox(address):
     with get_db() as conn:
-        conn.execute("DELETE FROM mailboxes WHERE id = ?", (mailbox_id,))
+        conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
     flash("Mailbox deleted.", "success")
     return redirect(url_for("index"))
 
 
-@APP.route("/mailbox/<int:mailbox_id>")
-def view_mailbox(mailbox_id):
+@APP.route("/mailbox/<path:address>")
+def view_mailbox(address):
     limit_raw = request.args.get("limit", str(DEFAULT_LIMIT))
     try:
         limit = int(limit_raw)
@@ -948,7 +1161,7 @@ def view_mailbox(mailbox_id):
 
     with get_db() as conn:
         mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE id = ?", (mailbox_id,)
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
         ).fetchone()
     if not mailbox:
         abort(404)
@@ -972,11 +1185,11 @@ def view_mailbox(mailbox_id):
     )
 
 
-@APP.route("/mailbox/<int:mailbox_id>/message/<uid>")
-def view_message(mailbox_id, uid):
+@APP.route("/mailbox/<path:address>/message/<uid>")
+def view_message(address, uid):
     with get_db() as conn:
         mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE id = ?", (mailbox_id,)
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
         ).fetchone()
     if not mailbox:
         abort(404)
@@ -986,7 +1199,7 @@ def view_message(mailbox_id, uid):
         message = fetch_message(mailbox, uid, folder=folder)
     except MailError as exc:
         flash(str(exc), "error")
-        return redirect(url_for("view_mailbox", mailbox_id=mailbox_id))
+        return redirect(url_for("view_mailbox", address=address))
 
     message["safe_body_html"] = sanitize_html(message["body_html"])
     return render_page(
@@ -998,11 +1211,11 @@ def view_message(mailbox_id, uid):
     )
 
 
-@APP.post("/mailbox/<int:mailbox_id>/message/<uid>/share")
-def share_message(mailbox_id, uid):
+@APP.post("/mailbox/<path:address>/message/<uid>/share")
+def share_message(address, uid):
     with get_db() as conn:
         mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE id = ?", (mailbox_id,)
+            "SELECT * FROM mailboxes WHERE address = ?", (address,)
         ).fetchone()
     if not mailbox:
         abort(404)
@@ -1012,7 +1225,7 @@ def share_message(mailbox_id, uid):
         message = fetch_message(mailbox, uid, folder=folder)
     except MailError as exc:
         flash(str(exc), "error")
-        return redirect(url_for("view_mailbox", mailbox_id=mailbox_id))
+        return redirect(url_for("view_mailbox", address=address))
 
     with get_db() as conn:
         code = generate_share_code(conn)
@@ -1062,7 +1275,12 @@ def delete_share(code):
 
 def main():
     init_db()
-    APP.run(host="0.0.0.0", port=5000, debug=False)
+    host = os.environ.get("MAILADMIN_HOST", "0.0.0.0")
+    port = int(os.environ.get("MAILADMIN_PORT", "5000"))
+    if os.environ.get("MAILADMIN_NO_BROWSER") != "1":
+        url = f"http://127.0.0.1:{port}/"
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    APP.run(host=host, port=port, debug=False)
 
 
 if __name__ == "__main__":
