@@ -69,6 +69,7 @@ Notes:
 Base: `http://127.0.0.1:5000`
 When calling endpoints with `{address}`, URL-encode the mailbox address.
 When multi-user mode is enabled, pass the API key via `X-API-Key` header (or `Authorization: Bearer <key>`).
+Full API docs: [api.md](https://github.com/V1an1337/MailAdmin/blob/main/api.md).
 
 ### Quick API guide
 Register a new API key:
