@@ -1,5 +1,5 @@
 __pycache__/*
 *build*
 dist/*
-getMail.spec
+*.spec
 mailadmin.db

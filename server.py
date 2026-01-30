@@ -7,8 +7,10 @@ import imaplib
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import string
+import sys
 import threading
 import time
 import webbrowser
@@ -561,6 +563,29 @@ def row_to_dict(row):
     if row is None:
         return None
     return dict(row)
+
+
+def is_port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def is_mailadmin_running(port):
+    url = f"http://127.0.0.1:{port}/api/health"
+    try:
+        resp = requests.get(url, timeout=1)
+        payload = resp.json()
+    except Exception:
+        return False
+    return resp.status_code == 200 and payload.get("ok") and payload.get("data", {}).get("status") == "ok"
+
+
+def maybe_open_browser(port):
+    if os.environ.get("MAILADMIN_NO_BROWSER") == "1":
+        return
+    url = f"http://127.0.0.1:{port}/"
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
 
 def format_ts(ts):
@@ -1277,9 +1302,14 @@ def main():
     init_db()
     host = os.environ.get("MAILADMIN_HOST", "0.0.0.0")
     port = int(os.environ.get("MAILADMIN_PORT", "5000"))
-    if os.environ.get("MAILADMIN_NO_BROWSER") != "1":
-        url = f"http://127.0.0.1:{port}/"
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    if is_port_open(port):
+        if is_mailadmin_running(port):
+            print(f"MailAdmin already running at http://127.0.0.1:{port}/")
+            maybe_open_browser(port)
+            return
+        print(f"Port {port} is already in use. Set MAILADMIN_PORT to another value.")
+        sys.exit(1)
+    maybe_open_browser(port)
     APP.run(host=host, port=port, debug=False)
 
 
