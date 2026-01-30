@@ -35,6 +35,17 @@ By default the app listens on `0.0.0.0:5000` and opens
 - `MAILADMIN_IMAP_HOST` (default `outlook.live.com`)
 - `MAILADMIN_SECRET` (Flask session secret; auto-generated if not set)
 - `MAILADMIN_NO_BROWSER=1` (disable auto open)
+- `MAILADMIN_MULTI_USER=1` (enable multi-user mode with API keys)
+
+The app auto-loads `.env` if present.
+
+## Multi-user mode
+When `MAILADMIN_MULTI_USER=1`, every user is identified by an API key:
+- Register to get a new API key (shown once). Save it safely.
+- Login validates the API key.
+- Logout clears local storage and cookies.
+- API key rotation is allowed once every 24 hours.
+- Mailboxes and shares are isolated per API key.
 
 ## Import mailboxes
 Import format (one per line):
@@ -50,37 +61,56 @@ Notes:
 - `/` Mailboxes
 - `/import` Import
 - `/shares` Share history
+- `/login` Login/Register
+- `/account` Rotate API key
+- `/logout` Clear local credentials
 
 ## API
 Base: `http://127.0.0.1:5000`
 When calling endpoints with `{address}`, URL-encode the mailbox address.
+When multi-user mode is enabled, pass the API key via `X-API-Key` header (or `Authorization: Bearer <key>`).
 
 ### Quick API guide
+Register a new API key:
+```bash
+curl -X POST http://127.0.0.1:5000/api/auth/register
+```
+
 Add a mailbox (JSON):
 ```bash
 curl -X POST http://127.0.0.1:5000/api/mailboxes \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
   -d '{"items":[{"address":"user@outlook.com","password":"","client_id":"","refresh_token":"YOUR_REFRESH_TOKEN"}]}'
 ```
 
 List mailboxes:
 ```bash
-curl http://127.0.0.1:5000/api/mailboxes
+curl -H "X-API-Key: YOUR_API_KEY" http://127.0.0.1:5000/api/mailboxes
 ```
 
 List messages for a mailbox (Inbox + Junk):
 ```bash
-curl "http://127.0.0.1:5000/api/mailboxes/user%40outlook.com/messages?limit=5"
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "http://127.0.0.1:5000/api/mailboxes/user%40outlook.com/messages?limit=5"
 ```
 
 Get a single message (use `uid` + `folder` from the list response):
 ```bash
-curl "http://127.0.0.1:5000/api/mailboxes/user%40outlook.com/message/12345?folder=Junk"
+curl -H "X-API-Key: YOUR_API_KEY" \
+  "http://127.0.0.1:5000/api/mailboxes/user%40outlook.com/message/12345?folder=Junk"
 ```
 
 ### Health
 ```
 GET /api/health
+```
+
+### Auth
+```
+POST /api/auth/login
+POST /api/auth/register
+POST /api/auth/rotate
 ```
 
 ### Mailboxes

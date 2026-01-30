@@ -29,6 +29,29 @@ from flask import (
     url_for,
 )
 
+def load_env_file(path):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+load_env_file(".env")
+
+
 APP = Flask(__name__)
 APP.secret_key = os.environ.get("MAILADMIN_SECRET", secrets.token_hex(16))
 
@@ -38,6 +61,8 @@ IMAP_HOST = os.environ.get("MAILADMIN_IMAP_HOST", "outlook.live.com")
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 50
 SHARE_CODE_LEN = 8
+MULTI_USER = os.environ.get("MAILADMIN_MULTI_USER", "0") == "1"
+API_KEY_COOKIE = "api_key"
 JUNK_FOLDERS = [
     "junk",
     "Junk",
@@ -159,6 +184,37 @@ BASE_TEMPLATE = """
       background: var(--accent);
       color: white;
       box-shadow: 0 10px 20px var(--ring);
+    }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 20, 20, 0.55);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 99;
+      padding: 24px;
+    }
+    .modal-card {
+      background: var(--card);
+      border-radius: 18px;
+      padding: 24px;
+      max-width: 520px;
+      width: min(520px, 92vw);
+      box-shadow: 0 18px 40px rgba(15, 20, 35, 0.2);
+      border: 1px solid rgba(28, 27, 25, 0.08);
+      text-align: left;
+    }
+    .key-box {
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 16px;
+      font-weight: 600;
+      background: #f7f4ee;
+      border: 1px dashed rgba(28, 27, 25, 0.2);
+      border-radius: 12px;
+      padding: 12px;
+      word-break: break-all;
+      margin: 12px 0 16px;
     }
     .card {
       background: var(--card);
@@ -323,6 +379,10 @@ BASE_TEMPLATE = """
         <a class="{{ 'active' if active == 'mailboxes' else '' }}" href="{{ url_for('index') }}">Mailboxes</a>
         <a class="{{ 'active' if active == 'import' else '' }}" href="{{ url_for('import_page') }}">Import</a>
         <a class="{{ 'active' if active == 'shares' else '' }}" href="{{ url_for('shares_page') }}">Recent shares</a>
+        <a class="{{ 'active' if active == 'account' else '' }}" href="{{ url_for('account_page') }}">Account</a>
+        {% if show_logout %}
+        <a href="{{ url_for('logout_page') }}">Logout</a>
+        {% endif %}
       </div>
     </div>
     {% with messages = get_flashed_messages(with_categories=True) %}
@@ -337,6 +397,21 @@ BASE_TEMPLATE = """
     {{ content|safe }}
     <div class="footer">MailAdmin local web console</div>
   </div>
+  <script>
+    (function () {
+      var key = window.localStorage ? localStorage.getItem("api_key") : "";
+      if (!key) {
+        return;
+      }
+      if (document.cookie.indexOf("{{ api_key_cookie }}=") === -1) {
+        document.cookie = "{{ api_key_cookie }}=" + encodeURIComponent(key) + "; path=/; max-age=31536000; SameSite=Lax";
+        if (!sessionStorage.getItem("api_key_synced")) {
+          sessionStorage.setItem("api_key_synced", "1");
+          window.location.reload();
+        }
+      }
+    })();
+  </script>
 </body>
 </html>
 """
@@ -500,6 +575,169 @@ SHARE_TEMPLATE = """
 </div>
 """
 
+LOGIN_TEMPLATE = """
+<div class="card">
+  <h2>Login or Register</h2>
+  <p>{{ message or 'Please login with your API key or register to get a new one.' }}</p>
+  <div style="display:grid; gap:12px;">
+    <input id="apiKeyInput" placeholder="API Key">
+    <div style="display:flex; gap:8px; flex-wrap: wrap;">
+      <button class="btn" type="button" id="loginBtn">Login</button>
+      <button class="btn secondary" type="button" id="registerBtn">Register</button>
+    </div>
+    <div id="loginStatus" class="mailbox-meta"></div>
+  </div>
+</div>
+<div id="keyModal" class="modal-backdrop" style="display:none;">
+  <div class="modal-card">
+    <h2>Save your API key</h2>
+    <p>Please save this key safely. You will need it to log in.</p>
+    <div class="key-box" id="keyBox"></div>
+    <button class="btn" type="button" id="confirmKeyBtn">I have saved it</button>
+  </div>
+</div>
+<script>
+  (function () {
+    var input = document.getElementById("apiKeyInput");
+    var status = document.getElementById("loginStatus");
+    var keyModal = document.getElementById("keyModal");
+    var keyBox = document.getElementById("keyBox");
+    var confirmBtn = document.getElementById("confirmKeyBtn");
+    var pendingKey = "";
+    var stored = window.localStorage ? localStorage.getItem("api_key") : "";
+    if (stored) {
+      input.value = stored;
+    }
+    function saveKey(key) {
+      if (window.localStorage) {
+        localStorage.setItem("api_key", key);
+      }
+      document.cookie = "{{ api_key_cookie }}=" + encodeURIComponent(key) + "; path=/; max-age=31536000; SameSite=Lax";
+    }
+    async function login() {
+      var key = input.value.trim();
+      if (!key) {
+        status.textContent = "API key is required.";
+        return;
+      }
+      status.textContent = "Checking...";
+      var resp = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: key })
+      });
+      var data = await resp.json().catch(function () { return {}; });
+      if (!data.ok) {
+        status.textContent = data.error || "Login failed.";
+        return;
+      }
+      saveKey(key);
+      status.textContent = "Logged in.";
+      window.location.href = "/";
+    }
+    async function register() {
+      status.textContent = "Creating API key...";
+      var resp = await fetch("/api/auth/register", { method: "POST" });
+      var data = await resp.json().catch(function () { return {}; });
+      if (!data.ok) {
+        status.textContent = data.error || "Register failed.";
+        return;
+      }
+      pendingKey = data.data.api_key;
+      keyBox.textContent = pendingKey;
+      keyModal.style.display = "flex";
+    }
+    confirmBtn.addEventListener("click", function () {
+      if (!pendingKey) {
+        return;
+      }
+      saveKey(pendingKey);
+      window.location.href = "/";
+    });
+    document.getElementById("loginBtn").addEventListener("click", login);
+    document.getElementById("registerBtn").addEventListener("click", register);
+  })();
+</script>
+"""
+
+ACCOUNT_TEMPLATE = """
+<div class="card">
+  <h2>Account</h2>
+  <p>Rotate your API key to invalidate the old one. Save the new key safely.</p>
+  <div style="display:flex; gap:8px; flex-wrap: wrap;">
+    <button class="btn secondary" type="button" id="rotateBtn">Rotate API Key</button>
+  </div>
+  <div id="rotateStatus" class="mailbox-meta" style="margin-top: 12px;"></div>
+</div>
+<div id="rotateModal" class="modal-backdrop" style="display:none;">
+  <div class="modal-card">
+    <h2>New API key</h2>
+    <p>Save this new key safely. The old key will stop working.</p>
+    <div class="key-box" id="rotateKeyBox"></div>
+    <button class="btn" type="button" id="confirmRotateBtn">I have saved it</button>
+  </div>
+</div>
+<script>
+  (function () {
+    var status = document.getElementById("rotateStatus");
+    var modal = document.getElementById("rotateModal");
+    var keyBox = document.getElementById("rotateKeyBox");
+    var confirmBtn = document.getElementById("confirmRotateBtn");
+    var pendingKey = "";
+    function saveKey(key) {
+      if (window.localStorage) {
+        localStorage.setItem("api_key", key);
+      }
+      document.cookie = "{{ api_key_cookie }}=" + encodeURIComponent(key) + "; path=/; max-age=31536000; SameSite=Lax";
+    }
+    async function rotate() {
+      status.textContent = "Rotating...";
+      var key = window.localStorage ? localStorage.getItem("api_key") : "";
+      var headers = { "Content-Type": "application/json" };
+      if (key) {
+        headers["X-API-Key"] = key;
+      }
+      var resp = await fetch("/api/auth/rotate", {
+        method: "POST",
+        headers: headers
+      });
+      var data = await resp.json().catch(function () { return {}; });
+      if (!data.ok) {
+        status.textContent = data.error || "Rotate failed.";
+        return;
+      }
+      pendingKey = data.data.api_key;
+      keyBox.textContent = pendingKey;
+      modal.style.display = "flex";
+    }
+    confirmBtn.addEventListener("click", function () {
+      if (!pendingKey) {
+        return;
+      }
+      saveKey(pendingKey);
+      window.location.href = "/";
+    });
+    document.getElementById("rotateBtn").addEventListener("click", rotate);
+  })();
+</script>
+"""
+
+LOGOUT_TEMPLATE = """
+<div class="card">
+  <h2>Logging out...</h2>
+  <p>Clearing local credentials.</p>
+</div>
+<script>
+  (function () {
+    if (window.localStorage) {
+      localStorage.removeItem("api_key");
+    }
+    document.cookie = "{{ api_key_cookie }}=; path=/; max-age=0; SameSite=Lax";
+    window.location.href = "/login";
+  })();
+</script>
+"""
+
 
 class MailError(Exception):
     pass
@@ -521,6 +759,7 @@ def init_db():
                 password TEXT NOT NULL DEFAULT '',
                 client_id TEXT NOT NULL DEFAULT '',
                 refresh_token TEXT NOT NULL DEFAULT '',
+                owner_key TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -535,17 +774,43 @@ def init_db():
                 mail_to TEXT,
                 mail_dt TEXT,
                 body_html TEXT,
+                owner_key TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                api_key TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_rotated_at INTEGER NOT NULL
+            )
+            """
+        )
+        ensure_column(conn, "mailboxes", "owner_key", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "shares", "owner_key", "TEXT NOT NULL DEFAULT ''")
+
+
+def ensure_column(conn, table, column, column_type):
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {row[1] for row in rows}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def render_page(title, template, **context):
+    context.setdefault("api_key_cookie", API_KEY_COOKIE)
+    context.setdefault("show_logout", is_logged_in())
     content = render_template_string(template, **context)
     active = context.pop("active", "")
     return render_template_string(
-        BASE_TEMPLATE, title=title, content=content, active=active
+        BASE_TEMPLATE,
+        title=title,
+        content=content,
+        active=active,
+        api_key_cookie=API_KEY_COOKIE,
+        show_logout=context.get("show_logout", False),
     )
 
 
@@ -563,6 +828,65 @@ def row_to_dict(row):
     if row is None:
         return None
     return dict(row)
+
+
+def get_api_key():
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    key = request.headers.get("X-API-Key")
+    if key:
+        return key.strip()
+    key = request.args.get("api_key") or request.cookies.get(API_KEY_COOKIE)
+    return key.strip() if key else ""
+
+
+def is_logged_in():
+    if not MULTI_USER:
+        return False
+    api_key = get_api_key()
+    return is_valid_api_key(api_key)
+
+
+def is_valid_api_key(api_key):
+    if not api_key:
+        return False
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT api_key FROM users WHERE api_key = ?", (api_key,)
+        ).fetchone()
+    return row is not None
+
+
+def generate_api_key(conn):
+    for _ in range(20):
+        key = secrets.token_hex(16)
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE api_key = ?", (key,)
+        ).fetchone()
+        if not exists:
+            return key
+    raise MailError("Failed to generate API key.")
+
+
+def require_user(api=False):
+    if not MULTI_USER:
+        return ""
+    api_key = get_api_key()
+    if not api_key:
+        return api_error("Unauthorized", status=401) if api else None
+    if not is_valid_api_key(api_key):
+        return api_error("Invalid API key.", status=401) if api else None
+    return api_key
+
+
+def render_login_page(message=None):
+    return render_page(
+        "Login - MailAdmin",
+        LOGIN_TEMPLATE,
+        message=message,
+        active="account",
+    )
 
 
 def is_port_open(port):
@@ -879,6 +1203,8 @@ def set_security_headers(response):
         "img-src https: data:; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; "
+        "script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "
         "form-action 'self'; "
         "frame-ancestors 'none'; "
         "base-uri 'none'"
@@ -890,10 +1216,19 @@ def set_security_headers(response):
 
 @APP.route("/")
 def index():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login or register to continue.")
     with get_db() as conn:
-        mailboxes = conn.execute(
-            "SELECT * FROM mailboxes ORDER BY created_at DESC"
-        ).fetchall()
+        if MULTI_USER:
+            mailboxes = conn.execute(
+                "SELECT * FROM mailboxes WHERE owner_key = ? ORDER BY created_at DESC",
+                (user_key,),
+            ).fetchall()
+        else:
+            mailboxes = conn.execute(
+                "SELECT * FROM mailboxes ORDER BY created_at DESC"
+            ).fetchall()
     return render_page(
         "Mailboxes - MailAdmin",
         INDEX_TEMPLATE,
@@ -906,6 +1241,9 @@ def index():
 
 @APP.route("/import")
 def import_page():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to import mailboxes.")
     return render_page(
         "Import - MailAdmin",
         IMPORT_TEMPLATE,
@@ -915,10 +1253,19 @@ def import_page():
 
 @APP.route("/shares")
 def shares_page():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to view shares.")
     with get_db() as conn:
-        shares = conn.execute(
-            "SELECT * FROM shares ORDER BY created_at DESC"
-        ).fetchall()
+        if MULTI_USER:
+            shares = conn.execute(
+                "SELECT * FROM shares WHERE owner_key = ? ORDER BY created_at DESC",
+                (user_key,),
+            ).fetchall()
+        else:
+            shares = conn.execute(
+                "SELECT * FROM shares ORDER BY created_at DESC"
+            ).fetchall()
     return render_page(
         "Shares - MailAdmin",
         SHARES_TEMPLATE,
@@ -928,23 +1275,131 @@ def shares_page():
     )
 
 
+@APP.route("/login")
+def login_page():
+    if not MULTI_USER:
+        return redirect(url_for("index"))
+    user_key = require_user()
+    if user_key is not None:
+        return redirect(url_for("index"))
+    return render_login_page()
+
+
+@APP.route("/account")
+def account_page():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to manage your account.")
+    return render_page(
+        "Account - MailAdmin",
+        ACCOUNT_TEMPLATE,
+        active="account",
+    )
+
+
+@APP.route("/logout")
+def logout_page():
+    response = render_page("Logout - MailAdmin", LOGOUT_TEMPLATE, active="account")
+    resp = APP.make_response(response)
+    resp.set_cookie(API_KEY_COOKIE, "", max_age=0, path="/")
+    return resp
+
+
 @APP.get("/api/health")
 def api_health():
-    return api_ok({"status": "ok", "time": int(time.time())})
+    return api_ok({"status": "ok", "time": int(time.time()), "multi_user": MULTI_USER})
+
+
+@APP.post("/api/auth/login")
+def api_auth_login():
+    data = request.get_json(silent=True) or {}
+    api_key = (data.get("api_key") or "").strip()
+    if not api_key:
+        return api_error("Missing api_key.", status=400)
+    if not is_valid_api_key(api_key):
+        return api_error("Invalid API key.", status=401)
+    return api_ok({"api_key": api_key})
+
+
+@APP.post("/api/auth/register")
+def api_auth_register():
+    if not MULTI_USER:
+        return api_error("Multi-user mode is disabled.", status=400)
+    with get_db() as conn:
+        api_key = generate_api_key(conn)
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO users (api_key, created_at, last_rotated_at) VALUES (?, ?, ?)",
+            (api_key, now, now),
+        )
+    return api_ok({"api_key": api_key})
+
+
+@APP.post("/api/auth/rotate")
+def api_auth_rotate():
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
+    if not MULTI_USER:
+        return api_error("Multi-user mode is disabled.", status=400)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT last_rotated_at FROM users WHERE api_key = ?",
+            (user_key,),
+        ).fetchone()
+        if not row:
+            return api_error("Invalid API key.", status=401)
+        now = int(time.time())
+        delta = now - int(row["last_rotated_at"] or 0)
+        if delta < 86400:
+            remaining = 86400 - delta
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            return api_error(
+                f"Rotate allowed once every 24 hours. Try again in {hours}h {minutes}m.",
+                status=429,
+            )
+        new_key = generate_api_key(conn)
+        conn.execute(
+            "INSERT INTO users (api_key, created_at, last_rotated_at) VALUES (?, ?, ?)",
+            (new_key, now, now),
+        )
+        conn.execute(
+            "UPDATE mailboxes SET owner_key = ? WHERE owner_key = ?",
+            (new_key, user_key),
+        )
+        conn.execute(
+            "UPDATE shares SET owner_key = ? WHERE owner_key = ?",
+            (new_key, user_key),
+        )
+        conn.execute("DELETE FROM users WHERE api_key = ?", (user_key,))
+    return api_ok({"api_key": new_key})
 
 
 @APP.get("/api/mailboxes")
 def api_list_mailboxes():
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        mailboxes = conn.execute(
-            "SELECT * FROM mailboxes ORDER BY created_at DESC"
-        ).fetchall()
+        if MULTI_USER:
+            mailboxes = conn.execute(
+                "SELECT * FROM mailboxes WHERE owner_key = ? ORDER BY created_at DESC",
+                (user_key,),
+            ).fetchall()
+        else:
+            mailboxes = conn.execute(
+                "SELECT * FROM mailboxes ORDER BY created_at DESC"
+            ).fetchall()
     payload = [row_to_dict(row) for row in mailboxes]
     return api_ok(payload)
 
 
 @APP.post("/api/mailboxes")
 def api_import_mailboxes():
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     entries = []
@@ -973,41 +1428,78 @@ def api_import_mailboxes():
 
     now = int(time.time())
     imported = 0
+    owner_errors = []
     with get_db() as conn:
         for address, password, client_id, refresh_token in entries:
             existing = conn.execute(
-                "SELECT id FROM mailboxes WHERE address = ?", (address,)
+                "SELECT id, owner_key FROM mailboxes WHERE address = ?",
+                (address,),
             ).fetchone()
             if existing:
+                if MULTI_USER and existing["owner_key"] not in ("", user_key):
+                    owner_errors.append(f"Address {address} already owned by another user.")
+                    continue
                 conn.execute(
                     """
                     UPDATE mailboxes
-                    SET password = ?, client_id = ?, refresh_token = ?, updated_at = ?
+                    SET password = ?, client_id = ?, refresh_token = ?, owner_key = ?, updated_at = ?
                     WHERE address = ?
                     """,
-                    (password, client_id, refresh_token, now, address),
+                    (
+                        password,
+                        client_id,
+                        refresh_token,
+                        user_key if MULTI_USER else "",
+                        now,
+                        address,
+                    ),
                 )
             else:
                 conn.execute(
                     """
-                    INSERT INTO mailboxes (address, password, client_id, refresh_token, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO mailboxes (address, password, client_id, refresh_token, owner_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (address, password, client_id, refresh_token, now, now),
+                    (
+                        address,
+                        password,
+                        client_id,
+                        refresh_token,
+                        user_key if MULTI_USER else "",
+                        now,
+                        now,
+                    ),
                 )
             imported += 1
+    if owner_errors:
+        for err in owner_errors[:3]:
+            flash(err, "error")
+        if len(owner_errors) > 3:
+            flash(f"{len(owner_errors) - 3} more errors hidden.", "error")
     return api_ok({"imported": imported, "errors": errors})
 
 
 @APP.delete("/api/mailboxes/<path:address>")
 def api_delete_mailbox(address):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
+        if MULTI_USER:
+            conn.execute(
+                "DELETE FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            )
+        else:
+            conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
     return api_ok({"deleted": address})
 
 
 @APP.get("/api/mailboxes/<path:address>/messages")
 def api_list_messages(address):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     limit_raw = request.args.get("limit", str(DEFAULT_LIMIT))
     try:
         limit = int(limit_raw)
@@ -1015,9 +1507,15 @@ def api_list_messages(address):
         limit = DEFAULT_LIMIT
     limit = max(1, min(MAX_LIMIT, limit))
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     try:
@@ -1043,10 +1541,19 @@ def api_list_messages(address):
 
 @APP.get("/api/mailboxes/<path:address>/message/<uid>")
 def api_get_message(address, uid):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     folder = request.args.get("folder")
@@ -1060,10 +1567,19 @@ def api_get_message(address, uid):
 
 @APP.post("/api/mailboxes/<path:address>/message/<uid>/share")
 def api_share_message(address, uid):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     folder = request.args.get("folder")
@@ -1076,8 +1592,8 @@ def api_share_message(address, uid):
         code = generate_share_code(conn)
         conn.execute(
             """
-            INSERT INTO shares (code, subject, mail_from, mail_to, mail_dt, body_html, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO shares (code, subject, mail_from, mail_to, mail_dt, body_html, owner_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 code,
@@ -1086,6 +1602,7 @@ def api_share_message(address, uid):
                 message["mail_to"],
                 message["mail_dt"],
                 build_share_body(message),
+                user_key if MULTI_USER else "",
                 int(time.time()),
             ),
         )
@@ -1096,20 +1613,38 @@ def api_share_message(address, uid):
 
 @APP.get("/api/shares")
 def api_list_shares():
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        shares = conn.execute(
-            "SELECT * FROM shares ORDER BY created_at DESC"
-        ).fetchall()
+        if MULTI_USER:
+            shares = conn.execute(
+                "SELECT * FROM shares WHERE owner_key = ? ORDER BY created_at DESC",
+                (user_key,),
+            ).fetchall()
+        else:
+            shares = conn.execute(
+                "SELECT * FROM shares ORDER BY created_at DESC"
+            ).fetchall()
     payload = [row_to_dict(row) for row in shares]
     return api_ok(payload)
 
 
 @APP.get("/api/shares/<code>")
 def api_get_share(code):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        share = conn.execute(
-            "SELECT * FROM shares WHERE code = ?", (code,)
-        ).fetchone()
+        if MULTI_USER:
+            share = conn.execute(
+                "SELECT * FROM shares WHERE code = ? AND owner_key = ?",
+                (code, user_key),
+            ).fetchone()
+        else:
+            share = conn.execute(
+                "SELECT * FROM shares WHERE code = ?", (code,)
+            ).fetchone()
     if not share:
         return api_error("Share not found.", status=404)
     return api_ok(row_to_dict(share))
@@ -1117,13 +1652,25 @@ def api_get_share(code):
 
 @APP.delete("/api/shares/<code>")
 def api_delete_share(code):
+    user_key = require_user(api=True)
+    if isinstance(user_key, tuple):
+        return user_key
     with get_db() as conn:
-        conn.execute("DELETE FROM shares WHERE code = ?", (code,))
+        if MULTI_USER:
+            conn.execute(
+                "DELETE FROM shares WHERE code = ? AND owner_key = ?",
+                (code, user_key),
+            )
+        else:
+            conn.execute("DELETE FROM shares WHERE code = ?", (code,))
     return api_ok({"deleted": code})
 
 
 @APP.post("/import")
 def import_mailboxes():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to import mailboxes.")
     payload = request.form.get("payload", "").strip()
     if not payload:
         flash("Import payload is empty.", "error")
@@ -1143,24 +1690,43 @@ def import_mailboxes():
     with get_db() as conn:
         for address, password, client_id, refresh_token in entries:
             existing = conn.execute(
-                "SELECT id FROM mailboxes WHERE address = ?", (address,)
+                "SELECT id, owner_key FROM mailboxes WHERE address = ?",
+                (address,),
             ).fetchone()
             if existing:
+                if MULTI_USER and existing["owner_key"] not in ("", user_key):
+                    errors.append(f"Address {address} already owned by another user.")
+                    continue
                 conn.execute(
                     """
                     UPDATE mailboxes
-                    SET password = ?, client_id = ?, refresh_token = ?, updated_at = ?
+                    SET password = ?, client_id = ?, refresh_token = ?, owner_key = ?, updated_at = ?
                     WHERE address = ?
                     """,
-                    (password, client_id, refresh_token, now, address),
+                    (
+                        password,
+                        client_id,
+                        refresh_token,
+                        user_key if MULTI_USER else "",
+                        now,
+                        address,
+                    ),
                 )
             else:
                 conn.execute(
                     """
-                    INSERT INTO mailboxes (address, password, client_id, refresh_token, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO mailboxes (address, password, client_id, refresh_token, owner_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (address, password, client_id, refresh_token, now, now),
+                    (
+                        address,
+                        password,
+                        client_id,
+                        refresh_token,
+                        user_key if MULTI_USER else "",
+                        now,
+                        now,
+                    ),
                 )
             imported += 1
     flash(f"Imported {imported} mailbox(es).", "success")
@@ -1169,14 +1735,26 @@ def import_mailboxes():
 
 @APP.post("/mailbox/<path:address>/delete")
 def delete_mailbox(address):
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to delete mailboxes.")
     with get_db() as conn:
-        conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
+        if MULTI_USER:
+            conn.execute(
+                "DELETE FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            )
+        else:
+            conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
     flash("Mailbox deleted.", "success")
     return redirect(url_for("index"))
 
 
 @APP.route("/mailbox/<path:address>")
 def view_mailbox(address):
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to view mailboxes.")
     limit_raw = request.args.get("limit", str(DEFAULT_LIMIT))
     try:
         limit = int(limit_raw)
@@ -1185,9 +1763,15 @@ def view_mailbox(address):
     limit = max(1, min(MAX_LIMIT, limit))
 
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         abort(404)
 
@@ -1212,10 +1796,19 @@ def view_mailbox(address):
 
 @APP.route("/mailbox/<path:address>/message/<uid>")
 def view_message(address, uid):
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to view messages.")
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         abort(404)
 
@@ -1238,10 +1831,19 @@ def view_message(address, uid):
 
 @APP.post("/mailbox/<path:address>/message/<uid>/share")
 def share_message(address, uid):
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to share messages.")
     with get_db() as conn:
-        mailbox = conn.execute(
-            "SELECT * FROM mailboxes WHERE address = ?", (address,)
-        ).fetchone()
+        if MULTI_USER:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
+                (address, user_key),
+            ).fetchone()
+        else:
+            mailbox = conn.execute(
+                "SELECT * FROM mailboxes WHERE address = ?", (address,)
+            ).fetchone()
     if not mailbox:
         abort(404)
 
@@ -1256,8 +1858,8 @@ def share_message(address, uid):
         code = generate_share_code(conn)
         conn.execute(
             """
-            INSERT INTO shares (code, subject, mail_from, mail_to, mail_dt, body_html, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO shares (code, subject, mail_from, mail_to, mail_dt, body_html, owner_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 code,
@@ -1266,6 +1868,7 @@ def share_message(address, uid):
                 message["mail_to"],
                 message["mail_dt"],
                 build_share_body(message),
+                user_key if MULTI_USER else "",
                 int(time.time()),
             ),
         )
@@ -1292,8 +1895,17 @@ def view_share(code):
 
 @APP.post("/share/<code>/delete")
 def delete_share(code):
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to manage shares.")
     with get_db() as conn:
-        conn.execute("DELETE FROM shares WHERE code = ?", (code,))
+        if MULTI_USER:
+            conn.execute(
+                "DELETE FROM shares WHERE code = ? AND owner_key = ?",
+                (code, user_key),
+            )
+        else:
+            conn.execute("DELETE FROM shares WHERE code = ?", (code,))
     flash("Share revoked.", "success")
     return redirect(url_for("index"))
 

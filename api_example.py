@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import os
 import sys
 from urllib.parse import quote
 
@@ -27,11 +28,10 @@ def request_json(method, url, **kwargs):
     return payload.get("data")
 
 
-def choose_mailbox(base_url, mailbox_address):
+def choose_mailbox(base_url, mailbox_address, headers):
     if mailbox_address:
         return mailbox_address
-    mailboxes = request_json("GET", f"{base_url}/api/mailboxes")
-    print(mailboxes)
+    mailboxes = request_json("GET", f"{base_url}/api/mailboxes", headers=headers)
     if not mailboxes:
         die("No mailboxes found. Import a mailbox first.")
     return mailboxes[0]["address"]
@@ -42,6 +42,11 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:5000")
     parser.add_argument("--mailbox-address")
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("MAILADMIN_API_KEY", ""),
+        help="API key for multi-user mode (or set MAILADMIN_API_KEY)",
+    )
     parser.add_argument(
         "--no-show-message",
         action="store_true",
@@ -55,12 +60,16 @@ def main():
     )
     args = parser.parse_args()
 
-    mailbox_address = choose_mailbox(args.base_url, args.mailbox_address)
+    headers = {}
+    if args.api_key:
+        headers["X-API-Key"] = args.api_key
+    mailbox_address = choose_mailbox(args.base_url, args.mailbox_address, headers)
     mailbox_path = quote(mailbox_address, safe="")
     messages = request_json(
         "GET",
         f"{args.base_url}/api/mailboxes/{mailbox_path}/messages",
         params={"limit": args.limit},
+        headers=headers,
     )
 
     if not messages:
@@ -91,6 +100,7 @@ def main():
         "GET",
         f"{args.base_url}/api/mailboxes/{mailbox_path}/message/{uid}",
         params=params,
+        headers=headers,
     )
 
     subject = detail.get("subject") or "(No subject)"
