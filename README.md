@@ -21,7 +21,7 @@ pip install -r requirements.txt
 
 ## Run
 ```bash
-python getMail.py
+python server.py
 ```
 
 By default the app listens on `0.0.0.0:5000` and opens
@@ -120,4 +120,4 @@ DELETE /api/shares/{code}
 
 ## Notes on Junk folder
 The app queries both Inbox and Junk folders for Outlook. If your Junk
-folder name differs, add it to `JUNK_FOLDERS` in `getMail.py`.
+folder name differs, add it to `JUNK_FOLDERS` in `server.py`.
