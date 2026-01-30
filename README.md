@@ -1,6 +1,8 @@
 # MailAdmin
 
 Multi-mailbox Outlook mail viewer with HTML previews, share links, and a JSON API.
+<img width="1445" height="692" alt="image" src="https://github.com/user-attachments/assets/ed7408db-9033-4a6a-a65b-dc8e49bf9726" />
+
 
 ## Features
 - Import and manage multiple mailboxes.
