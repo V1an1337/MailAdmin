@@ -63,6 +63,8 @@ MAX_LIMIT = 50
 SHARE_CODE_LEN = 8
 MULTI_USER = os.environ.get("MAILADMIN_MULTI_USER", "0") == "1"
 API_KEY_COOKIE = "api_key"
+PUBLIC_BASE_URL = os.environ.get("MAILADMIN_PUBLIC_BASE_URL", "https://oauth.v1an.xyz").rstrip("/")
+OPENAPI_VERSION = "1.0.0"
 JUNK_FOLDERS = [
     "junk",
     "Junk",
@@ -379,6 +381,7 @@ BASE_TEMPLATE = """
         <a class="{{ 'active' if active == 'mailboxes' else '' }}" href="{{ url_for('index') }}">Mailboxes</a>
         <a class="{{ 'active' if active == 'import' else '' }}" href="{{ url_for('import_page') }}">Import</a>
         <a class="{{ 'active' if active == 'shares' else '' }}" href="{{ url_for('shares_page') }}">Recent shares</a>
+        <a class="{{ 'active' if active == 'docs' else '' }}" href="{{ url_for('api_docs_page') }}">API Docs</a>
         <a class="{{ 'active' if active == 'account' else '' }}" href="{{ url_for('account_page') }}">Account</a>
         {% if show_logout %}
         <a href="{{ url_for('logout_page') }}">Logout</a>
@@ -739,6 +742,58 @@ LOGOUT_TEMPLATE = """
 """
 
 
+DOCS_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MailAdmin API Docs</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+  <style>
+    body { margin: 0; background: #faf7f0; }
+    .top {
+      padding: 12px 16px;
+      font-family: "Space Grotesk", sans-serif;
+      background: #1c1b19;
+      color: #ffffff;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .top a {
+      color: #ffffff;
+      text-decoration: none;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>MailAdmin API Documentation</div>
+    <a href="{{ home_url }}">Back to App</a>
+  </div>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "{{ spec_url }}",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      displayRequestDuration: true,
+      persistAuthorization: true,
+      docExpansion: "list"
+    });
+  </script>
+</body>
+</html>
+"""
+
+
 class MailError(Exception):
     pass
 
@@ -910,6 +965,301 @@ def maybe_open_browser(port):
         return
     url = f"http://127.0.0.1:{port}/"
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+
+def openapi_servers():
+    host_url = ""
+    try:
+        host_url = request.host_url.rstrip("/")
+    except RuntimeError:
+        host_url = ""
+    servers = []
+    seen = set()
+    for candidate in [host_url, "http://127.0.0.1:5000", PUBLIC_BASE_URL]:
+        if not candidate:
+            continue
+        url = candidate.rstrip("/")
+        if url and url not in seen:
+            seen.add(url)
+            servers.append({"url": url})
+    return servers
+
+
+def build_openapi_spec():
+    auth_security = [{"ApiKeyAuth": []}, {"BearerAuth": []}]
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "MailAdmin API",
+            "version": OPENAPI_VERSION,
+            "description": (
+                "MailAdmin public API. In multi-user mode, authenticated endpoints "
+                "require X-API-Key or Bearer token."
+            ),
+        },
+        "servers": openapi_servers(),
+        "tags": [
+            {"name": "Health"},
+            {"name": "Auth"},
+            {"name": "Mailboxes"},
+            {"name": "Messages"},
+            {"name": "Shares"},
+        ],
+        "paths": {
+            "/api/health": {
+                "get": {
+                    "tags": ["Health"],
+                    "summary": "Health check",
+                    "operationId": "getHealth",
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                }
+            },
+            "/api/auth/login": {
+                "post": {
+                    "tags": ["Auth"],
+                    "summary": "Validate API key",
+                    "operationId": "authLogin",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthLoginRequest"}}},
+                    },
+                    "responses": {
+                        "200": {"description": "Login success", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "401": {"description": "Invalid key", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/auth/register": {
+                "post": {
+                    "tags": ["Auth"],
+                    "summary": "Register and return new API key",
+                    "operationId": "authRegister",
+                    "responses": {
+                        "200": {"description": "Register success", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "400": {"description": "Multi-user disabled", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/auth/rotate": {
+                "post": {
+                    "tags": ["Auth"],
+                    "summary": "Rotate API key (24h cooldown)",
+                    "operationId": "authRotate",
+                    "security": auth_security,
+                    "responses": {
+                        "200": {"description": "Rotate success", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "401": {"description": "Unauthorized", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                        "429": {"description": "Cooldown", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/mailboxes": {
+                "get": {
+                    "tags": ["Mailboxes"],
+                    "summary": "List mailboxes",
+                    "operationId": "listMailboxes",
+                    "security": auth_security,
+                    "responses": {"200": {"description": "Mailbox list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                },
+                "post": {
+                    "tags": ["Mailboxes"],
+                    "summary": "Import/update mailboxes",
+                    "operationId": "importMailboxes",
+                    "security": auth_security,
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/MailboxImportRequest"}},
+                            "text/plain": {"schema": {"type": "string", "description": "Each line: Address----Password----ClientID----OAuth2Token"}},
+                            "application/x-www-form-urlencoded": {
+                                "schema": {"type": "object", "properties": {"payload": {"type": "string"}}}
+                            },
+                        },
+                    },
+                    "responses": {"200": {"description": "Import result", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                },
+            },
+            "/api/mailboxes/{address}": {
+                "delete": {
+                    "tags": ["Mailboxes"],
+                    "summary": "Delete mailbox",
+                    "operationId": "deleteMailbox",
+                    "security": auth_security,
+                    "parameters": [{"$ref": "#/components/parameters/AddressParam"}],
+                    "responses": {"200": {"description": "Delete result", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                }
+            },
+            "/api/mailboxes/{address}/messages": {
+                "get": {
+                    "tags": ["Messages"],
+                    "summary": "List mailbox messages (Inbox + Junk)",
+                    "operationId": "listMailboxMessages",
+                    "security": auth_security,
+                    "parameters": [
+                        {"$ref": "#/components/parameters/AddressParam"},
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                            "description": "Number of messages to return.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Message list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/mailboxes/{address}/message/{uid}": {
+                "get": {
+                    "tags": ["Messages"],
+                    "summary": "Get one message detail",
+                    "operationId": "getMailboxMessage",
+                    "security": auth_security,
+                    "parameters": [
+                        {"$ref": "#/components/parameters/AddressParam"},
+                        {"$ref": "#/components/parameters/UidParam"},
+                        {
+                            "name": "folder",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "string"},
+                            "description": "IMAP folder name from message list response.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Message detail", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/mailboxes/{address}/message/{uid}/share": {
+                "post": {
+                    "tags": ["Messages"],
+                    "summary": "Create share link for message",
+                    "operationId": "shareMailboxMessage",
+                    "security": auth_security,
+                    "parameters": [
+                        {"$ref": "#/components/parameters/AddressParam"},
+                        {"$ref": "#/components/parameters/UidParam"},
+                        {
+                            "name": "folder",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "string"},
+                            "description": "IMAP folder name from message list response.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Share created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                }
+            },
+            "/api/shares": {
+                "get": {
+                    "tags": ["Shares"],
+                    "summary": "List shares",
+                    "operationId": "listShares",
+                    "security": auth_security,
+                    "responses": {"200": {"description": "Share list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                }
+            },
+            "/api/shares/{code}": {
+                "get": {
+                    "tags": ["Shares"],
+                    "summary": "Get share detail",
+                    "operationId": "getShare",
+                    "security": auth_security,
+                    "parameters": [{"$ref": "#/components/parameters/CodeParam"}],
+                    "responses": {
+                        "200": {"description": "Share detail", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "404": {"description": "Share not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
+                    },
+                },
+                "delete": {
+                    "tags": ["Shares"],
+                    "summary": "Delete share",
+                    "operationId": "deleteShare",
+                    "security": auth_security,
+                    "parameters": [{"$ref": "#/components/parameters/CodeParam"}],
+                    "responses": {"200": {"description": "Share deleted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                },
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+                "BearerAuth": {"type": "http", "scheme": "bearer"},
+            },
+            "parameters": {
+                "AddressParam": {
+                    "name": "address",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "description": "URL-encoded mailbox address, e.g. user%40outlook.com",
+                },
+                "UidParam": {
+                    "name": "uid",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "description": "IMAP message UID.",
+                },
+                "CodeParam": {
+                    "name": "code",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "description": "Share code.",
+                },
+            },
+            "schemas": {
+                "ApiEnvelope": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "data": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["ok"],
+                },
+                "ApiError": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean", "example": False},
+                        "error": {"type": "string"},
+                    },
+                    "required": ["ok", "error"],
+                },
+                "AuthLoginRequest": {
+                    "type": "object",
+                    "properties": {"api_key": {"type": "string"}},
+                    "required": ["api_key"],
+                },
+                "MailboxImportItem": {
+                    "type": "object",
+                    "properties": {
+                        "address": {"type": "string"},
+                        "password": {"type": "string"},
+                        "client_id": {"type": "string"},
+                        "refresh_token": {"type": "string"},
+                    },
+                    "required": ["address"],
+                },
+                "MailboxImportRequest": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/MailboxImportItem"},
+                        }
+                    },
+                },
+            },
+        },
+    }
 
 
 def format_ts(ts):
@@ -1201,9 +1551,9 @@ def set_security_headers(response):
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; "
         "img-src https: data:; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
         "font-src https://fonts.gstatic.com; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
         "connect-src 'self'; "
         "form-action 'self'; "
         "frame-ancestors 'none'; "
@@ -1212,6 +1562,20 @@ def set_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     return response
+
+
+@APP.get("/openapi.json")
+def openapi_json():
+    return jsonify(build_openapi_spec())
+
+
+@APP.get("/docs")
+def api_docs_page():
+    return render_template_string(
+        DOCS_TEMPLATE,
+        spec_url=url_for("openapi_json"),
+        home_url=url_for("index"),
+    )
 
 
 @APP.route("/")

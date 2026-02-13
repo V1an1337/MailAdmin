@@ -2,6 +2,12 @@
 
 Base URL: `http://127.0.0.1:5000`
 
+Production URL: `https://oauth.v1an.xyz`
+
+Interactive docs:
+- Swagger UI: `/docs`
+- OpenAPI spec JSON: `/openapi.json`
+
 All responses are JSON in the form:
 ```json
 { "ok": true, "data": ... }
@@ -18,6 +24,26 @@ If `MAILADMIN_MULTI_USER=1`:
 - `Authorization: Bearer <api_key>`
 
 If multi-user is disabled, auth headers are ignored.
+
+## OpenAPI and SDK generation
+
+This project now exposes an OpenAPI spec at:
+- Local: `http://127.0.0.1:5000/openapi.json`
+- Production: `https://oauth.v1an.xyz/openapi.json`
+
+Generate Python client using `openapi-python-client`:
+```bash
+pip install openapi-python-client
+openapi-python-client generate --url https://oauth.v1an.xyz/openapi.json
+```
+
+Generate Python client using `openapi-generator`:
+```bash
+openapi-generator-cli generate \
+  -i https://oauth.v1an.xyz/openapi.json \
+  -g python \
+  -o ./mailadmin-python-sdk
+```
 
 ## Health
 
@@ -40,6 +66,19 @@ Example:
 ```bash
 curl http://127.0.0.1:5000/api/health
 ```
+
+## Documentation endpoints
+
+### GET /openapi.json
+Return machine-readable OpenAPI JSON schema.
+
+Example:
+```bash
+curl http://127.0.0.1:5000/openapi.json
+```
+
+### GET /docs
+Swagger UI web docs (human-friendly interactive API explorer).
 
 ## Auth
 
