@@ -22,6 +22,8 @@ from flask import (
     Flask,
     abort,
     flash,
+    g,
+    has_request_context,
     jsonify,
     redirect,
     render_template_string,
@@ -65,6 +67,11 @@ MULTI_USER = os.environ.get("MAILADMIN_MULTI_USER", "0") == "1"
 API_KEY_COOKIE = "api_key"
 PUBLIC_BASE_URL = os.environ.get("MAILADMIN_PUBLIC_BASE_URL", "https://oauth.v1an.xyz").rstrip("/")
 OPENAPI_VERSION = "1.0.0"
+TOKEN_REFRESH_ENABLED = os.environ.get("MAILADMIN_TOKEN_REFRESH_ENABLED", "1") == "1"
+TOKEN_REFRESH_INTERVAL_SEC = float(os.environ.get("MAILADMIN_TOKEN_REFRESH_INTERVAL_SEC", "1.0"))
+TOKEN_REFRESH_DAYS = int(os.environ.get("MAILADMIN_TOKEN_REFRESH_DAYS", "60"))
+TOKEN_VALID_DAYS = 90
+TOKEN_REFRESH_BACKOFF_SEC = 15 * 60
 JUNK_FOLDERS = [
     "junk",
     "Junk",
@@ -422,8 +429,11 @@ BASE_TEMPLATE = """
 INDEX_TEMPLATE = """
 <div class="card">
   <div class="section-title">
-    <h2>Mailboxes</h2>
-    <span class="mailbox-meta">{{ mailboxes|length }} total</span>
+    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2>Mailboxes</h2>
+      <span class="mailbox-meta">{{ mailboxes|length }} total</span>
+    </div>
+    <a class="btn secondary small" href="{{ url_for('export_mailboxes_txt') }}">Export TXT</a>
   </div>
   {% if not mailboxes %}
     <p>No mailboxes yet.</p>
@@ -435,7 +445,13 @@ INDEX_TEMPLATE = """
         <div class="mailbox-meta">
           Auth: {{ auth_label(box) }}
           | Added: {{ format_ts(box['created_at']) }}
+          | Token: {{ box['token_status'] or 'unknown' }}
         </div>
+        {% if box['token_status'] in ['warning', 'rollback_ok', 'degraded'] and box['token_last_warning'] %}
+        <div class="mailbox-meta" style="color:#a13227; margin-top:4px;">
+          {{ box['token_last_warning'] }}
+        </div>
+        {% endif %}
       </div>
       <div style="display:flex; gap:8px; flex-wrap: wrap;">
         <a class="btn secondary small" href="{{ url_for('view_mailbox', address=box['address']) }}">Inbox</a>
@@ -498,6 +514,10 @@ MAILBOX_TEMPLATE = """
     <h2>{{ mailbox['address'] }}</h2>
     <span class="mailbox-meta">Showing {{ messages|length }} message(s) | Inbox + Junk</span>
   </div>
+  {% if mailbox['token_status'] in ['warning', 'rollback_ok', 'degraded'] and mailbox['token_last_warning'] %}
+    <p style="color:#a13227;">Token warning: {{ mailbox['token_last_warning'] }}</p>
+  {% endif %}
+  <p class="mailbox-meta">Token status: {{ mailbox['token_status'] or 'unknown' }}</p>
   <form method="get" class="toolbar">
     <div style="display:flex; align-items:center; gap:8px;">
       <label for="limit">Limit</label>
@@ -798,6 +818,13 @@ class MailError(Exception):
     pass
 
 
+class TokenRefreshError(MailError):
+    def __init__(self, message, kind="token_error", status_code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.status_code = status_code
+
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -814,6 +841,16 @@ def init_db():
                 password TEXT NOT NULL DEFAULT '',
                 client_id TEXT NOT NULL DEFAULT '',
                 refresh_token TEXT NOT NULL DEFAULT '',
+                refresh_token_prev TEXT NOT NULL DEFAULT '',
+                refresh_token_updated_at INTEGER NOT NULL DEFAULT 0,
+                refresh_token_prev_updated_at INTEGER NOT NULL DEFAULT 0,
+                refresh_token_expires_at INTEGER NOT NULL DEFAULT 0,
+                token_next_refresh_at INTEGER NOT NULL DEFAULT 0,
+                token_refresh_priority INTEGER NOT NULL DEFAULT 0,
+                token_status TEXT NOT NULL DEFAULT 'unknown',
+                token_last_error TEXT NOT NULL DEFAULT '',
+                token_last_error_at INTEGER NOT NULL DEFAULT 0,
+                token_last_warning TEXT NOT NULL DEFAULT '',
                 owner_key TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -844,6 +881,16 @@ def init_db():
             """
         )
         ensure_column(conn, "mailboxes", "owner_key", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mailboxes", "refresh_token_prev", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mailboxes", "refresh_token_updated_at", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "refresh_token_prev_updated_at", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "refresh_token_expires_at", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "token_next_refresh_at", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "token_refresh_priority", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "token_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        ensure_column(conn, "mailboxes", "token_last_error", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mailboxes", "token_last_error_at", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "mailboxes", "token_last_warning", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "shares", "owner_key", "TEXT NOT NULL DEFAULT ''")
 
 
@@ -852,6 +899,246 @@ def ensure_column(conn, table, column, column_type):
     names = {row[1] for row in rows}
     if column not in names:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def utc_now():
+    return int(time.time())
+
+
+def token_refresh_seconds():
+    days = max(1, TOKEN_REFRESH_DAYS)
+    return days * 24 * 3600
+
+
+def token_expire_seconds():
+    return TOKEN_VALID_DAYS * 24 * 3600
+
+
+def token_is_rate_limited(error_text):
+    text = (error_text or "").lower()
+    return "429" in text or "too many requests" in text or "throttl" in text
+
+
+def imap_error_fallback_eligible(error_text):
+    text = (error_text or "").lower()
+    if token_is_rate_limited(text):
+        return True
+    if "auth" in text or "invalid" in text:
+        return True
+    return False
+
+
+def token_schedule_success(mailbox_id, now_ts, keep_warning=False, next_refresh_at=None, warning_status="warning"):
+    next_ts = next_refresh_at if next_refresh_at is not None else now_ts + token_refresh_seconds()
+    with get_db() as conn:
+        if keep_warning:
+            conn.execute(
+                """
+                UPDATE mailboxes
+                SET token_status = ?, token_last_error = '', token_last_error_at = 0,
+                    token_refresh_priority = 0, token_next_refresh_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (warning_status, next_ts, now_ts, mailbox_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE mailboxes
+                SET token_status = ?, token_last_error = '', token_last_error_at = 0,
+                    token_last_warning = '', token_refresh_priority = 0,
+                    token_next_refresh_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("healthy", next_ts, now_ts, mailbox_id),
+            )
+
+
+def mark_refresh_token_checked(mailbox_id, now_ts):
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET refresh_token_updated_at = ?, refresh_token_expires_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now_ts, now_ts + token_expire_seconds(), now_ts, mailbox_id),
+        )
+
+
+def set_token_warning(mailbox_id, warning, status="warning", next_refresh_at=None):
+    now_ts = utc_now()
+    next_ts = next_refresh_at if next_refresh_at is not None else now_ts + TOKEN_REFRESH_BACKOFF_SEC
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET token_status = ?, token_last_warning = ?, token_next_refresh_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, warning, next_ts, now_ts, mailbox_id),
+        )
+    if has_request_context():
+        g.token_runtime_warning = warning
+
+
+def set_token_error(mailbox_id, error, status="warning", next_refresh_at=None):
+    now_ts = utc_now()
+    next_ts = next_refresh_at if next_refresh_at is not None else now_ts + TOKEN_REFRESH_BACKOFF_SEC
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET token_status = ?, token_last_error = ?, token_last_error_at = ?,
+                token_next_refresh_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, error, now_ts, next_ts, now_ts, mailbox_id),
+        )
+
+
+def get_mailbox_by_id(mailbox_id):
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM mailboxes WHERE id = ?", (mailbox_id,)).fetchone()
+
+
+def mailbox_value(mailbox, key, default=""):
+    if mailbox is None:
+        return default
+    if isinstance(mailbox, dict):
+        return mailbox.get(key, default)
+    try:
+        value = mailbox[key]
+    except Exception:
+        return default
+    return value if value is not None else default
+
+
+def rotate_refresh_token(mailbox_id, new_refresh_token, now_ts):
+    with get_db() as conn:
+        mailbox = conn.execute(
+            "SELECT refresh_token FROM mailboxes WHERE id = ?", (mailbox_id,)
+        ).fetchone()
+        if not mailbox:
+            return
+        old_refresh_token = mailbox["refresh_token"] or ""
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET refresh_token_prev = ?, refresh_token_prev_updated_at = ?,
+                refresh_token = ?, refresh_token_updated_at = ?, refresh_token_expires_at = ?,
+                token_status = ?, token_last_error = '', token_last_error_at = 0,
+                token_last_warning = '', token_refresh_priority = 0, token_next_refresh_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                old_refresh_token,
+                now_ts,
+                new_refresh_token,
+                now_ts,
+                now_ts + token_expire_seconds(),
+                "healthy",
+                now_ts + token_refresh_seconds(),
+                now_ts,
+                mailbox_id,
+            ),
+        )
+
+
+def try_fallback_to_previous_token(mailbox, fail_reason):
+    mailbox_id = mailbox["id"]
+    prev_token = (mailbox["refresh_token_prev"] or "").strip()
+    current_token = (mailbox["refresh_token"] or "").strip()
+    if not prev_token:
+        warning = f"Token fallback unavailable: no previous token. Reason: {fail_reason}"
+        set_token_warning(mailbox_id, warning, status="degraded")
+        return False, warning
+
+    try:
+        # Validate old token before rollback.
+        get_access_token(mailbox["client_id"], prev_token)
+    except TokenRefreshError as exc:
+        warning = f"Token fallback failed: previous token invalid ({exc})."
+        set_token_warning(mailbox_id, warning, status="degraded")
+        set_token_error(mailbox_id, str(exc), status="degraded")
+        return False, warning
+
+    now_ts = utc_now()
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET refresh_token = ?, refresh_token_updated_at = ?, refresh_token_expires_at = ?,
+                refresh_token_prev = ?, refresh_token_prev_updated_at = ?,
+                token_status = ?, token_last_warning = ?, token_last_error = '', token_last_error_at = 0,
+                token_refresh_priority = 0, token_next_refresh_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                prev_token,
+                now_ts,
+                now_ts + token_expire_seconds(),
+                current_token,
+                now_ts,
+                "rollback_ok",
+                f"Token rollback succeeded using previous refresh token. Cause: {fail_reason}",
+                now_ts + token_refresh_seconds(),
+                now_ts,
+                mailbox_id,
+            ),
+        )
+
+    warning = f"Rollback applied for {mailbox['address']}: switched to previous refresh token."
+    if has_request_context():
+        g.token_runtime_warning = warning
+    return True, warning
+
+
+def oauth_access_token_for_mailbox(mailbox, allow_fallback=True):
+    mailbox_id = mailbox["id"]
+    now_ts = utc_now()
+    try:
+        token_data = get_access_token(mailbox["client_id"], mailbox["refresh_token"])
+    except TokenRefreshError as exc:
+        detail = f"{exc.kind}: {exc}"
+        set_token_error(mailbox_id, detail, status="warning")
+        if allow_fallback:
+            latest = get_mailbox_by_id(mailbox_id) or mailbox
+            rolled_back, _ = try_fallback_to_previous_token(latest, detail)
+            if rolled_back:
+                retry_mailbox = get_mailbox_by_id(mailbox_id) or latest
+                return oauth_access_token_for_mailbox(retry_mailbox, allow_fallback=False)
+        raise
+
+    new_refresh_token = (token_data.get("refresh_token") or "").strip()
+    if new_refresh_token and new_refresh_token != (mailbox["refresh_token"] or "").strip():
+        rotate_refresh_token(mailbox_id, new_refresh_token, now_ts)
+        mailbox = get_mailbox_by_id(mailbox_id) or mailbox
+    else:
+        mark_refresh_token_checked(mailbox_id, now_ts)
+        keep_warning = (mailbox["token_status"] or "") in ("warning", "rollback_ok", "degraded")
+        token_schedule_success(
+            mailbox_id,
+            now_ts,
+            keep_warning=keep_warning,
+            next_refresh_at=now_ts + 24 * 3600,
+            warning_status="rollback_ok" if (mailbox["token_status"] or "") == "rollback_ok" else "warning",
+        )
+    return token_data.get("access_token"), mailbox
+
+
+def mailbox_needs_priority_refresh(client_id, refresh_token):
+    return bool(client_id and refresh_token)
+
+
+def get_runtime_warning():
+    if not has_request_context():
+        return ""
+    warning = getattr(g, "token_runtime_warning", "")
+    if warning:
+        g.token_runtime_warning = ""
+    return warning
 
 
 def render_page(title, template, **context):
@@ -994,7 +1281,9 @@ def build_openapi_spec():
             "version": OPENAPI_VERSION,
             "description": (
                 "MailAdmin public API. In multi-user mode, authenticated endpoints "
-                "require X-API-Key or Bearer token."
+                "require X-API-Key or Bearer token. Mailbox objects include token "
+                "health fields (token_status, token_last_warning, token_last_error). "
+                "Message/share responses may include warning when token fallback occurred."
             ),
         },
         "servers": openapi_servers(),
@@ -1059,7 +1348,12 @@ def build_openapi_spec():
                     "summary": "List mailboxes",
                     "operationId": "listMailboxes",
                     "security": auth_security,
-                    "responses": {"200": {"description": "Mailbox list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}}},
+                    "responses": {
+                        "200": {
+                            "description": "Mailbox list (includes token_status/token_last_warning/token_last_error fields).",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}},
+                        }
+                    },
                 },
                 "post": {
                     "tags": ["Mailboxes"],
@@ -1106,7 +1400,10 @@ def build_openapi_spec():
                         },
                     ],
                     "responses": {
-                        "200": {"description": "Message list", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "200": {
+                            "description": "Message list. When fallback occurs, data may be {messages: [...], warning: '...'}",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}},
+                        },
                         "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
                     },
                 }
@@ -1129,7 +1426,10 @@ def build_openapi_spec():
                         },
                     ],
                     "responses": {
-                        "200": {"description": "Message detail", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "200": {
+                            "description": "Message detail (may include warning field after fallback).",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}},
+                        },
                         "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
                     },
                 }
@@ -1152,7 +1452,10 @@ def build_openapi_spec():
                         },
                     ],
                     "responses": {
-                        "200": {"description": "Share created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}}},
+                        "200": {
+                            "description": "Share created (may include warning field after fallback).",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiEnvelope"}}},
+                        },
                         "404": {"description": "Mailbox not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiError"}}}},
                     },
                 }
@@ -1309,7 +1612,105 @@ def parse_import_payload(payload):
     return results, errors
 
 
+def export_mailboxes_text(rows):
+    lines = []
+    for row in rows:
+        address = str(row["address"] or "").replace("\r", " ").replace("\n", " ").strip()
+        password = str(row["password"] or "").replace("\r", " ").replace("\n", " ").strip()
+        client_id = str(row["client_id"] or "").replace("\r", " ").replace("\n", " ").strip()
+        refresh_token = str(row["refresh_token"] or "").replace("\r", " ").replace("\n", " ").strip()
+        lines.append(f"{address}----{password}----{client_id}----{refresh_token}")
+    return "\n".join(lines)
+
+
+def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token, owner_key, now_ts):
+    existing = conn.execute(
+        "SELECT * FROM mailboxes WHERE address = ?",
+        (address,),
+    ).fetchone()
+    if existing and MULTI_USER and existing["owner_key"] not in ("", owner_key):
+        return False, f"Address {address} already owned by another user."
+
+    owner_value = owner_key if MULTI_USER else ""
+    needs_priority = mailbox_needs_priority_refresh(client_id, refresh_token)
+    token_status = "pending_initial" if needs_priority else "unknown"
+    token_refresh_priority = 1 if needs_priority else 0
+    token_next_refresh_at = now_ts if needs_priority else 0
+
+    refresh_token_prev = ""
+    refresh_token_prev_updated_at = 0
+    if existing:
+        refresh_token_prev = existing["refresh_token_prev"] or ""
+        refresh_token_prev_updated_at = int(existing["refresh_token_prev_updated_at"] or 0)
+        old_token = (existing["refresh_token"] or "").strip()
+        new_token = (refresh_token or "").strip()
+        if old_token and new_token and old_token != new_token:
+            refresh_token_prev = old_token
+            refresh_token_prev_updated_at = now_ts
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET password = ?, client_id = ?, refresh_token = ?, refresh_token_prev = ?,
+                refresh_token_prev_updated_at = ?, refresh_token_updated_at = 0,
+                refresh_token_expires_at = 0, token_status = ?, token_last_error = '',
+                token_last_error_at = 0, token_last_warning = '',
+                token_refresh_priority = ?, token_next_refresh_at = ?,
+                owner_key = ?, updated_at = ?
+            WHERE address = ?
+            """,
+            (
+                password,
+                client_id,
+                refresh_token,
+                refresh_token_prev,
+                refresh_token_prev_updated_at,
+                token_status,
+                token_refresh_priority,
+                token_next_refresh_at,
+                owner_value,
+                now_ts,
+                address,
+            ),
+        )
+        return True, None
+
+    conn.execute(
+        """
+        INSERT INTO mailboxes (
+            address, password, client_id, refresh_token, refresh_token_prev,
+            refresh_token_updated_at, refresh_token_prev_updated_at, refresh_token_expires_at,
+            token_next_refresh_at, token_refresh_priority, token_status,
+            token_last_error, token_last_error_at, token_last_warning,
+            owner_key, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            address,
+            password,
+            client_id,
+            refresh_token,
+            "",
+            0,
+            0,
+            0,
+            token_next_refresh_at,
+            token_refresh_priority,
+            token_status,
+            "",
+            0,
+            "",
+            owner_value,
+            now_ts,
+            now_ts,
+        ),
+    )
+    return True, None
+
+
 def get_access_token(client_id, refresh_token):
+    if not client_id or not refresh_token:
+        raise TokenRefreshError("Missing client_id or refresh_token.", kind="token_error")
     url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     data = {
         "client_id": client_id,
@@ -1318,23 +1719,44 @@ def get_access_token(client_id, refresh_token):
     }
     try:
         response = requests.post(url, data=data, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
     except requests.RequestException as exc:
-        raise MailError(f"Token request failed: {exc}") from exc
-    except ValueError as exc:
-        raise MailError("Token response invalid JSON.") from exc
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        kind = "rate_limited" if status_code == 429 or token_is_rate_limited(str(exc)) else "token_error"
+        raise TokenRefreshError(
+            f"Token request failed: {exc}",
+            kind=kind,
+            status_code=status_code,
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code >= 400:
+        detail = payload.get("error_description") or payload.get("error") or response.text[:160]
+        kind = "rate_limited" if response.status_code == 429 or token_is_rate_limited(detail) else "token_error"
+        raise TokenRefreshError(
+            f"Token error ({response.status_code}): {detail}",
+            kind=kind,
+            status_code=response.status_code,
+        )
 
     error_description = payload.get("error_description")
     error = payload.get("error")
     if error_description or error:
         detail = error_description or error
-        raise MailError(f"Token error: {detail}")
+        kind = "rate_limited" if token_is_rate_limited(detail) else "token_error"
+        raise TokenRefreshError(f"Token error: {detail}", kind=kind, status_code=response.status_code)
 
     access_token = payload.get("access_token")
     if not access_token:
-        raise MailError("Access token missing.")
-    return access_token
+        raise TokenRefreshError("Access token missing.", kind="token_error", status_code=response.status_code)
+    return {
+        "access_token": access_token,
+        "refresh_token": payload.get("refresh_token") or "",
+        "expires_in": payload.get("expires_in"),
+    }
 
 
 def generate_auth_string(email_name, access_token):
@@ -1379,19 +1801,52 @@ def parse_date(value):
         return "", 0
 
 
-def connect_mailbox(mailbox):
-    mail = imaplib.IMAP4_SSL(IMAP_HOST)
-    if mailbox["refresh_token"]:
-        if mailbox["client_id"]:
-            access_token = get_access_token(mailbox["client_id"], mailbox["refresh_token"])
+def close_mail_connection(mail):
+    if mail is None:
+        return
+    try:
+        mail.logout()
+    except Exception:
+        pass
+
+
+def connect_mailbox(mailbox, allow_fallback=True):
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST)
+        if mailbox["refresh_token"]:
+            if mailbox["client_id"]:
+                access_token, _ = oauth_access_token_for_mailbox(mailbox, allow_fallback=allow_fallback)
+            else:
+                access_token = mailbox["refresh_token"]
+            mail.authenticate(
+                "XOAUTH2",
+                lambda _: generate_auth_string(mailbox["address"], access_token),
+            )
+        elif mailbox["password"]:
+            mail.login(mailbox["address"], mailbox["password"])
         else:
-            access_token = mailbox["refresh_token"]
-        mail.authenticate("XOAUTH2", lambda _: generate_auth_string(mailbox["address"], access_token))
-    elif mailbox["password"]:
-        mail.login(mailbox["address"], mailbox["password"])
-    else:
-        raise MailError("No authentication data configured.")
-    return mail
+            raise MailError("No authentication data configured.")
+        return mail
+    except TokenRefreshError as exc:
+        close_mail_connection(mail)
+        raise MailError(str(exc)) from exc
+    except imaplib.IMAP4.error as exc:
+        close_mail_connection(mail)
+        if allow_fallback and mailbox_value(mailbox, "client_id") and mailbox_value(mailbox, "refresh_token"):
+            if imap_error_fallback_eligible(str(exc)):
+                latest = get_mailbox_by_id(mailbox["id"]) or mailbox
+                rolled_back, _ = try_fallback_to_previous_token(
+                    latest,
+                    f"imap_auth_error: {exc}",
+                )
+                if rolled_back:
+                    retry_mailbox = get_mailbox_by_id(mailbox["id"]) or latest
+                    return connect_mailbox(retry_mailbox, allow_fallback=False)
+        raise MailError(f"IMAP authentication failed: {exc}") from exc
+    except Exception as exc:
+        close_mail_connection(mail)
+        raise MailError(f"Mailbox connect failed: {exc}") from exc
 
 
 def extract_message(raw_email):
@@ -1440,16 +1895,26 @@ def sanitize_html(value):
     return cleaned
 
 
-def list_messages(mailbox, limit):
+def list_messages(mailbox, limit, allow_fallback=True):
     mail = None
     try:
-        mail = connect_mailbox(mailbox)
+        mail = connect_mailbox(mailbox, allow_fallback=allow_fallback)
         messages = []
         folders = ["INBOX"] + JUNK_FOLDERS
         for folder in folders:
             try:
                 status, _ = mail.select(folder, readonly=True)
-            except imaplib.IMAP4.error:
+            except imaplib.IMAP4.error as exc:
+                if allow_fallback and mailbox_value(mailbox, "client_id") and mailbox_value(mailbox, "refresh_token"):
+                    if imap_error_fallback_eligible(str(exc)):
+                        latest = get_mailbox_by_id(mailbox["id"]) or mailbox
+                        rolled_back, _ = try_fallback_to_previous_token(
+                            latest,
+                            f"imap_select_error: {exc}",
+                        )
+                        if rolled_back:
+                            retry_mailbox = get_mailbox_by_id(mailbox["id"]) or latest
+                            return list_messages(retry_mailbox, limit, allow_fallback=False)
                 continue
             if status != "OK":
                 continue
@@ -1484,22 +1949,37 @@ def list_messages(mailbox, limit):
 
         messages.sort(key=lambda item: item.get("mail_ts", 0), reverse=True)
         return messages[:limit]
+    except MailError:
+        raise
+    except Exception as exc:
+        raise MailError(str(exc)) from exc
     finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+        close_mail_connection(mail)
 
 
-def fetch_message(mailbox, uid, folder=None):
+def fetch_message(mailbox, uid, folder=None, allow_fallback=True):
     mail = None
     try:
-        mail = connect_mailbox(mailbox)
+        mail = connect_mailbox(mailbox, allow_fallback=allow_fallback)
         folder_name = normalize_folder(folder)
         try:
             status, _ = mail.select(folder_name, readonly=True)
         except imaplib.IMAP4.error as exc:
+            if allow_fallback and mailbox_value(mailbox, "client_id") and mailbox_value(mailbox, "refresh_token"):
+                if imap_error_fallback_eligible(str(exc)):
+                    latest = get_mailbox_by_id(mailbox["id"]) or mailbox
+                    rolled_back, _ = try_fallback_to_previous_token(
+                        latest,
+                        f"imap_select_error: {exc}",
+                    )
+                    if rolled_back:
+                        retry_mailbox = get_mailbox_by_id(mailbox["id"]) or latest
+                        return fetch_message(
+                            retry_mailbox,
+                            uid,
+                            folder=folder_name,
+                            allow_fallback=False,
+                        )
             raise MailError(f"Mailbox select failed: {exc}") from exc
         if status != "OK":
             raise MailError("Mailbox select failed.")
@@ -1518,12 +1998,12 @@ def fetch_message(mailbox, uid, folder=None):
         parsed["folder"] = folder_name
         parsed["folder_label"] = folder_label(folder_name)
         return parsed
+    except MailError:
+        raise
+    except Exception as exc:
+        raise MailError(str(exc)) from exc
     finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+        close_mail_connection(mail)
 
 
 def build_share_body(message):
@@ -1601,6 +2081,36 @@ def index():
         auth_label=auth_label,
         active="mailboxes",
     )
+
+
+@APP.get("/export/mailboxes.txt")
+def export_mailboxes_txt():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("Please login to export mailboxes.")
+    with get_db() as conn:
+        if MULTI_USER:
+            rows = conn.execute(
+                """
+                SELECT address, password, client_id, refresh_token
+                FROM mailboxes
+                WHERE owner_key = ?
+                ORDER BY created_at DESC
+                """,
+                (user_key,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT address, password, client_id, refresh_token
+                FROM mailboxes
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+    payload = export_mailboxes_text(rows) + ("\n" if rows else "")
+    response = APP.response_class(payload, mimetype="text/plain")
+    response.headers["Content-Disposition"] = "attachment; filename=mailboxes.txt"
+    return response
 
 
 @APP.route("/import")
@@ -1795,45 +2305,18 @@ def api_import_mailboxes():
     owner_errors = []
     with get_db() as conn:
         for address, password, client_id, refresh_token in entries:
-            existing = conn.execute(
-                "SELECT id, owner_key FROM mailboxes WHERE address = ?",
-                (address,),
-            ).fetchone()
-            if existing:
-                if MULTI_USER and existing["owner_key"] not in ("", user_key):
-                    owner_errors.append(f"Address {address} already owned by another user.")
-                    continue
-                conn.execute(
-                    """
-                    UPDATE mailboxes
-                    SET password = ?, client_id = ?, refresh_token = ?, owner_key = ?, updated_at = ?
-                    WHERE address = ?
-                    """,
-                    (
-                        password,
-                        client_id,
-                        refresh_token,
-                        user_key if MULTI_USER else "",
-                        now,
-                        address,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO mailboxes (address, password, client_id, refresh_token, owner_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        address,
-                        password,
-                        client_id,
-                        refresh_token,
-                        user_key if MULTI_USER else "",
-                        now,
-                        now,
-                    ),
-                )
+            ok, err = upsert_mailbox_from_import(
+                conn,
+                address,
+                password,
+                client_id,
+                refresh_token,
+                user_key,
+                now,
+            )
+            if not ok:
+                owner_errors.append(err)
+                continue
             imported += 1
     if owner_errors:
         for err in owner_errors[:3]:
@@ -1900,6 +2383,9 @@ def api_list_messages(address):
                 "folder_label": msg.get("folder_label"),
             }
         )
+    warning = get_runtime_warning()
+    if warning:
+        return api_ok({"messages": payload, "warning": warning})
     return api_ok(payload)
 
 
@@ -1926,6 +2412,9 @@ def api_get_message(address, uid):
     except MailError as exc:
         return api_error(str(exc), status=500)
     message["safe_body_html"] = sanitize_html(message["body_html"])
+    warning = get_runtime_warning()
+    if warning:
+        message["warning"] = warning
     return api_ok(message)
 
 
@@ -1972,7 +2461,11 @@ def api_share_message(address, uid):
         )
 
     share_url = request.host_url.rstrip("/") + url_for("view_share", code=code)
-    return api_ok({"code": code, "url": share_url})
+    payload = {"code": code, "url": share_url}
+    warning = get_runtime_warning()
+    if warning:
+        payload["warning"] = warning
+    return api_ok(payload)
 
 
 @APP.get("/api/shares")
@@ -2053,45 +2546,18 @@ def import_mailboxes():
     imported = 0
     with get_db() as conn:
         for address, password, client_id, refresh_token in entries:
-            existing = conn.execute(
-                "SELECT id, owner_key FROM mailboxes WHERE address = ?",
-                (address,),
-            ).fetchone()
-            if existing:
-                if MULTI_USER and existing["owner_key"] not in ("", user_key):
-                    errors.append(f"Address {address} already owned by another user.")
-                    continue
-                conn.execute(
-                    """
-                    UPDATE mailboxes
-                    SET password = ?, client_id = ?, refresh_token = ?, owner_key = ?, updated_at = ?
-                    WHERE address = ?
-                    """,
-                    (
-                        password,
-                        client_id,
-                        refresh_token,
-                        user_key if MULTI_USER else "",
-                        now,
-                        address,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO mailboxes (address, password, client_id, refresh_token, owner_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        address,
-                        password,
-                        client_id,
-                        refresh_token,
-                        user_key if MULTI_USER else "",
-                        now,
-                        now,
-                    ),
-                )
+            ok, err = upsert_mailbox_from_import(
+                conn,
+                address,
+                password,
+                client_id,
+                refresh_token,
+                user_key,
+                now,
+            )
+            if not ok:
+                errors.append(err)
+                continue
             imported += 1
     flash(f"Imported {imported} mailbox(es).", "success")
     return redirect(url_for("import_page"))
@@ -2145,6 +2611,9 @@ def view_mailbox(address):
         messages = list_messages(mailbox, limit)
     except MailError as exc:
         error = str(exc)
+    warning = get_runtime_warning()
+    if warning:
+        flash(warning, "error")
 
     return render_page(
         f"Inbox - {mailbox['address']}",
@@ -2182,6 +2651,9 @@ def view_message(address, uid):
     except MailError as exc:
         flash(str(exc), "error")
         return redirect(url_for("view_mailbox", address=address))
+    warning = get_runtime_warning()
+    if warning:
+        flash(warning, "error")
 
     message["safe_body_html"] = sanitize_html(message["body_html"])
     return render_page(
@@ -2217,6 +2689,9 @@ def share_message(address, uid):
     except MailError as exc:
         flash(str(exc), "error")
         return redirect(url_for("view_mailbox", address=address))
+    warning = get_runtime_warning()
+    if warning:
+        flash(warning, "error")
 
     with get_db() as conn:
         code = generate_share_code(conn)
@@ -2274,6 +2749,89 @@ def delete_share(code):
     return redirect(url_for("index"))
 
 
+def get_due_mailbox_for_token_refresh(now_ts):
+    stale_before = now_ts - token_refresh_seconds()
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM mailboxes
+            WHERE client_id != ''
+              AND refresh_token != ''
+              AND (
+                    token_refresh_priority = 1
+                    OR token_next_refresh_at <= ?
+                    OR token_next_refresh_at = 0
+                    OR refresh_token_updated_at = 0
+                    OR refresh_token_updated_at <= ?
+              )
+            ORDER BY token_refresh_priority DESC, token_next_refresh_at ASC, updated_at ASC
+            LIMIT 1
+            """,
+            (now_ts, stale_before),
+        ).fetchone()
+
+
+def refresh_mailbox_token_keepalive(mailbox):
+    now_ts = utc_now()
+    mailbox_id = mailbox["id"]
+    try:
+        oauth_access_token_for_mailbox(mailbox, allow_fallback=True)
+    except TokenRefreshError as exc:
+        next_ts = now_ts + TOKEN_REFRESH_BACKOFF_SEC
+        set_token_error(mailbox_id, f"{exc.kind}: {exc}", status="warning", next_refresh_at=next_ts)
+        latest = get_mailbox_by_id(mailbox_id)
+        if latest and (latest["token_status"] or "") not in ("rollback_ok", "degraded"):
+            set_token_warning(
+                mailbox_id,
+                f"Keepalive refresh failed: {exc}",
+                status="warning",
+                next_refresh_at=next_ts,
+            )
+    except Exception as exc:
+        next_ts = now_ts + TOKEN_REFRESH_BACKOFF_SEC
+        set_token_error(mailbox_id, f"keepalive_error: {exc}", status="warning", next_refresh_at=next_ts)
+        set_token_warning(
+            mailbox_id,
+            f"Keepalive refresh failed: {exc}",
+            status="warning",
+            next_refresh_at=next_ts,
+        )
+
+
+def token_keepalive_worker():
+    print("Token keepalive worker started.")
+    while True:
+        started = time.time()
+        try:
+            now_ts = utc_now()
+            mailbox = get_due_mailbox_for_token_refresh(now_ts)
+            if mailbox is None:
+                time.sleep(min(max(TOKEN_REFRESH_INTERVAL_SEC, 0.2), 2.0))
+                continue
+            refresh_mailbox_token_keepalive(mailbox)
+        except Exception as exc:
+            print(f"Token keepalive worker error: {exc}")
+            time.sleep(1.0)
+            continue
+        elapsed = time.time() - started
+        sleep_sec = TOKEN_REFRESH_INTERVAL_SEC - elapsed
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+
+def start_token_keepalive_worker():
+    if not TOKEN_REFRESH_ENABLED:
+        print("Token keepalive disabled.")
+        return
+    worker = threading.Thread(
+        target=token_keepalive_worker,
+        name="mailadmin-token-keepalive",
+        daemon=True,
+    )
+    worker.start()
+
+
 def main():
     init_db()
     host = os.environ.get("MAILADMIN_HOST", "0.0.0.0")
@@ -2285,6 +2843,7 @@ def main():
             return
         print(f"Port {port} is already in use. Set MAILADMIN_PORT to another value.")
         sys.exit(1)
+    start_token_keepalive_worker()
     maybe_open_browser(port)
     APP.run(host=host, port=port, debug=False)
 

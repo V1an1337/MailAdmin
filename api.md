@@ -25,6 +25,21 @@ If `MAILADMIN_MULTI_USER=1`:
 
 If multi-user is disabled, auth headers are ignored.
 
+## Token Keepalive
+
+The server runs a background refresh worker for Outlook OAuth refresh tokens.
+
+Config:
+- `MAILADMIN_TOKEN_REFRESH_ENABLED` (default `1`)
+- `MAILADMIN_TOKEN_REFRESH_INTERVAL_SEC` (default `1.0`)
+- `MAILADMIN_TOKEN_REFRESH_DAYS` (default `60`)
+
+Behavior:
+- New OAuth mailbox imports are marked `pending_initial` and queued immediately.
+- Successful refresh rotates to new refresh token when returned.
+- Previous refresh token is retained for rollback.
+- On token usage failure, server may auto-fallback to previous token.
+
 ## OpenAPI and SDK generation
 
 This project now exposes an OpenAPI spec at:
@@ -158,6 +173,14 @@ Response item fields:
 - `owner_key` (string)
 - `created_at` (unix timestamp)
 - `updated_at` (unix timestamp)
+- `token_status` (`unknown` | `healthy` | `pending_initial` | `warning` | `rollback_ok` | `degraded`)
+- `token_last_warning` (string)
+- `token_last_error` (string)
+- `token_last_error_at` (unix timestamp)
+- `token_next_refresh_at` (unix timestamp)
+- `refresh_token_updated_at` (unix timestamp)
+- `refresh_token_prev_updated_at` (unix timestamp)
+- `refresh_token_expires_at` (unix timestamp)
 
 Example:
 ```bash
@@ -261,6 +284,14 @@ Response item fields:
 - `folder` (string, IMAP folder name)
 - `folder_label` ("Inbox" or "Junk")
 
+If token fallback happened during this request, `data` may be:
+```json
+{
+  "messages": [ ... ],
+  "warning": "Rollback applied for user@outlook.com: switched to previous refresh token."
+}
+```
+
 Example:
 ```bash
 curl "http://127.0.0.1:5000/api/mailboxes/user%40outlook.com/messages?limit=5" \
@@ -286,6 +317,7 @@ Response fields include:
 - `subject`, `mail_from`, `mail_to`, `mail_dt`, `mail_ts`
 - `body_text`, `body_html`, `safe_body_html`
 - `folder`, `folder_label`, `uid`
+- Optional: `warning` (string) when fallback occurred during this request
 
 Example:
 ```bash
@@ -311,6 +343,18 @@ X-API-Key: YOUR_API_KEY
 Response:
 ```json
 { "ok": true, "data": { "code": "Ab12Cd34", "url": "http://127.0.0.1:5000/share/Ab12Cd34" } }
+```
+
+If fallback happened, response may also contain:
+```json
+{
+  "ok": true,
+  "data": {
+    "code": "Ab12Cd34",
+    "url": "http://127.0.0.1:5000/share/Ab12Cd34",
+    "warning": "Rollback applied for user@outlook.com: switched to previous refresh token."
+  }
+}
 ```
 
 Example:

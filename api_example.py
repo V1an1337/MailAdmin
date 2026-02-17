@@ -71,10 +71,17 @@ def main():
         params={"limit": args.limit},
         headers=headers,
     )
+    warning = ""
+    if isinstance(messages, dict):
+        warning = messages.get("warning") or ""
+        messages = messages.get("messages") or []
 
     if not messages:
         print("No messages.")
         return
+
+    if warning:
+        print(f"[warning] {warning}")
 
     print(f"Mailbox {mailbox_address} messages:")
     for msg in messages:
@@ -102,6 +109,7 @@ def main():
         params=params,
         headers=headers,
     )
+    detail_warning = detail.get("warning") or ""
 
     subject = detail.get("subject") or "(No subject)"
     sender = detail.get("mail_from") or "-"
@@ -121,6 +129,8 @@ def main():
     print(f"To: {recipient}")
     print(f"Date: {when}")
     print(f"Folder: {folder_label}")
+    if detail_warning:
+        print(f"Warning: {detail_warning}")
     print("\nBody:")
     print(body or "(empty)")
 

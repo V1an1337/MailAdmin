@@ -11,6 +11,7 @@ Multi-mailbox Outlook mail viewer with HTML previews, share links, and a JSON AP
 - Share messages via `/share/{8chars}` links.
 - Full JSON API for automation.
 - Auto-opens the default browser on start.
+- Token keepalive system with proactive refresh + rollback fallback.
 
 ## Requirements
 - Python 3.10+
@@ -36,6 +37,9 @@ By default the app listens on `0.0.0.0:5000` and opens
 - `MAILADMIN_SECRET` (Flask session secret; auto-generated if not set)
 - `MAILADMIN_NO_BROWSER=1` (disable auto open)
 - `MAILADMIN_MULTI_USER=1` (enable multi-user mode with API keys)
+- `MAILADMIN_TOKEN_REFRESH_ENABLED=1` (enable background refresh worker)
+- `MAILADMIN_TOKEN_REFRESH_INTERVAL_SEC=1.0` (max refresh rate)
+- `MAILADMIN_TOKEN_REFRESH_DAYS=60` (proactive refresh window)
 
 The app auto-loads `.env` if present.
 
