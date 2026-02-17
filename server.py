@@ -60,7 +60,7 @@ APP.secret_key = os.environ.get("MAILADMIN_SECRET", secrets.token_hex(16))
 #DB_PATH = os.path.join(os.path.dirname(__file__), "mailadmin.db")
 DB_PATH = "mailadmin.db"
 IMAP_HOST = os.environ.get("MAILADMIN_IMAP_HOST", "outlook.live.com")
-DEFAULT_LIMIT = 10
+DEFAULT_LIMIT = 5
 MAX_LIMIT = 50
 SHARE_CODE_LEN = 8
 MULTI_USER = os.environ.get("MAILADMIN_MULTI_USER", "0") == "1"
@@ -71,6 +71,7 @@ TOKEN_REFRESH_ENABLED = os.environ.get("MAILADMIN_TOKEN_REFRESH_ENABLED", "1") =
 TOKEN_REFRESH_INTERVAL_SEC = float(os.environ.get("MAILADMIN_TOKEN_REFRESH_INTERVAL_SEC", "1.0"))
 TOKEN_REFRESH_DAYS = int(os.environ.get("MAILADMIN_TOKEN_REFRESH_DAYS", "60"))
 TOKEN_VALID_DAYS = 90
+ACCESS_TOKEN_CACHE_SECONDS = 3600
 TOKEN_REFRESH_BACKOFF_SEC = 15 * 60
 JUNK_FOLDERS = [
     "junk",
@@ -841,6 +842,8 @@ def init_db():
                 password TEXT NOT NULL DEFAULT '',
                 client_id TEXT NOT NULL DEFAULT '',
                 refresh_token TEXT NOT NULL DEFAULT '',
+                access_token_cached TEXT NOT NULL DEFAULT '',
+                access_token_expires_at INTEGER NOT NULL DEFAULT 0,
                 refresh_token_prev TEXT NOT NULL DEFAULT '',
                 refresh_token_updated_at INTEGER NOT NULL DEFAULT 0,
                 refresh_token_prev_updated_at INTEGER NOT NULL DEFAULT 0,
@@ -881,6 +884,8 @@ def init_db():
             """
         )
         ensure_column(conn, "mailboxes", "owner_key", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mailboxes", "access_token_cached", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mailboxes", "access_token_expires_at", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "mailboxes", "refresh_token_prev", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "mailboxes", "refresh_token_updated_at", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "mailboxes", "refresh_token_prev_updated_at", "INTEGER NOT NULL DEFAULT 0")
@@ -963,6 +968,53 @@ def mark_refresh_token_checked(mailbox_id, now_ts):
             WHERE id = ?
             """,
             (now_ts, now_ts + token_expire_seconds(), now_ts, mailbox_id),
+        )
+
+
+def get_cached_access_token(mailbox, now_ts):
+    token = (mailbox_value(mailbox, "access_token_cached") or "").strip()
+    if not token:
+        return ""
+    expires_at_raw = mailbox_value(mailbox, "access_token_expires_at", 0)
+    try:
+        expires_at = int(expires_at_raw or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at <= now_ts + 5:
+        return ""
+    return token
+
+
+def cache_access_token(mailbox_id, access_token, now_ts, expires_in=None):
+    ttl = ACCESS_TOKEN_CACHE_SECONDS
+    try:
+        provider_ttl = int(expires_in or 0)
+    except (TypeError, ValueError):
+        provider_ttl = 0
+    if provider_ttl > 0:
+        ttl = min(ttl, provider_ttl)
+    expires_at = now_ts + max(60, ttl)
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET access_token_cached = ?, access_token_expires_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (access_token, expires_at, now_ts, mailbox_id),
+        )
+
+
+def clear_access_token_cache(mailbox_id, now_ts=None):
+    when = now_ts or utc_now()
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET access_token_cached = '', access_token_expires_at = 0, updated_at = ?
+            WHERE id = ?
+            """,
+            (when, mailbox_id),
         )
 
 
@@ -1057,7 +1109,7 @@ def try_fallback_to_previous_token(mailbox, fail_reason):
 
     try:
         # Validate old token before rollback.
-        get_access_token(mailbox["client_id"], prev_token)
+        token_data = get_access_token(mailbox["client_id"], prev_token)
     except TokenRefreshError as exc:
         warning = f"Token fallback failed: previous token invalid ({exc})."
         set_token_warning(mailbox_id, warning, status="degraded")
@@ -1065,12 +1117,29 @@ def try_fallback_to_previous_token(mailbox, fail_reason):
         return False, warning
 
     now_ts = utc_now()
+    validated_access_token = (token_data.get("access_token") or "").strip()
+    validated_refresh_token = (token_data.get("refresh_token") or "").strip()
+    if validated_refresh_token:
+        prev_token = validated_refresh_token
+
+    access_token_expires_at = 0
+    if validated_access_token:
+        ttl = ACCESS_TOKEN_CACHE_SECONDS
+        try:
+            provider_ttl = int(token_data.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            provider_ttl = 0
+        if provider_ttl > 0:
+            ttl = min(ttl, provider_ttl)
+        access_token_expires_at = now_ts + max(60, ttl)
+
     with get_db() as conn:
         conn.execute(
             """
             UPDATE mailboxes
             SET refresh_token = ?, refresh_token_updated_at = ?, refresh_token_expires_at = ?,
                 refresh_token_prev = ?, refresh_token_prev_updated_at = ?,
+                access_token_cached = ?, access_token_expires_at = ?,
                 token_status = ?, token_last_warning = ?, token_last_error = '', token_last_error_at = 0,
                 token_refresh_priority = 0, token_next_refresh_at = ?, updated_at = ?
             WHERE id = ?
@@ -1081,6 +1150,8 @@ def try_fallback_to_previous_token(mailbox, fail_reason):
                 now_ts + token_expire_seconds(),
                 current_token,
                 now_ts,
+                validated_access_token,
+                access_token_expires_at,
                 "rollback_ok",
                 f"Token rollback succeeded using previous refresh token. Cause: {fail_reason}",
                 now_ts + token_refresh_seconds(),
@@ -1095,9 +1166,12 @@ def try_fallback_to_previous_token(mailbox, fail_reason):
     return True, warning
 
 
-def oauth_access_token_for_mailbox(mailbox, allow_fallback=True):
+def oauth_access_token_for_mailbox(mailbox, allow_fallback=True, allow_cached=True):
     mailbox_id = mailbox["id"]
     now_ts = utc_now()
+    cached_access_token = get_cached_access_token(mailbox, now_ts) if allow_cached else ""
+    if cached_access_token:
+        return cached_access_token, mailbox
     try:
         token_data = get_access_token(mailbox["client_id"], mailbox["refresh_token"])
     except TokenRefreshError as exc:
@@ -1108,13 +1182,15 @@ def oauth_access_token_for_mailbox(mailbox, allow_fallback=True):
             rolled_back, _ = try_fallback_to_previous_token(latest, detail)
             if rolled_back:
                 retry_mailbox = get_mailbox_by_id(mailbox_id) or latest
-                return oauth_access_token_for_mailbox(retry_mailbox, allow_fallback=False)
+                return oauth_access_token_for_mailbox(retry_mailbox, allow_fallback=False, allow_cached=allow_cached)
         raise
 
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise TokenRefreshError("Access token missing.", kind="token_error")
     new_refresh_token = (token_data.get("refresh_token") or "").strip()
     if new_refresh_token and new_refresh_token != (mailbox["refresh_token"] or "").strip():
         rotate_refresh_token(mailbox_id, new_refresh_token, now_ts)
-        mailbox = get_mailbox_by_id(mailbox_id) or mailbox
     else:
         mark_refresh_token_checked(mailbox_id, now_ts)
         keep_warning = (mailbox["token_status"] or "") in ("warning", "rollback_ok", "degraded")
@@ -1122,10 +1198,12 @@ def oauth_access_token_for_mailbox(mailbox, allow_fallback=True):
             mailbox_id,
             now_ts,
             keep_warning=keep_warning,
-            next_refresh_at=now_ts + 24 * 3600,
+            next_refresh_at=now_ts + token_refresh_seconds(),
             warning_status="rollback_ok" if (mailbox["token_status"] or "") == "rollback_ok" else "warning",
         )
-    return token_data.get("access_token"), mailbox
+    cache_access_token(mailbox_id, access_token, now_ts, token_data.get("expires_in"))
+    mailbox = get_mailbox_by_id(mailbox_id) or mailbox
+    return access_token, mailbox
 
 
 def mailbox_needs_priority_refresh(client_id, refresh_token):
@@ -1652,6 +1730,7 @@ def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token
             UPDATE mailboxes
             SET password = ?, client_id = ?, refresh_token = ?, refresh_token_prev = ?,
                 refresh_token_prev_updated_at = ?, refresh_token_updated_at = 0,
+                access_token_cached = '', access_token_expires_at = 0,
                 refresh_token_expires_at = 0, token_status = ?, token_last_error = '',
                 token_last_error_at = 0, token_last_warning = '',
                 token_refresh_priority = ?, token_next_refresh_at = ?,
@@ -1677,19 +1756,22 @@ def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token
     conn.execute(
         """
         INSERT INTO mailboxes (
-            address, password, client_id, refresh_token, refresh_token_prev,
+            address, password, client_id, refresh_token, access_token_cached,
+            access_token_expires_at, refresh_token_prev,
             refresh_token_updated_at, refresh_token_prev_updated_at, refresh_token_expires_at,
             token_next_refresh_at, token_refresh_priority, token_status,
             token_last_error, token_last_error_at, token_last_warning,
             owner_key, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             address,
             password,
             client_id,
             refresh_token,
+            "",
+            0,
             "",
             0,
             0,
@@ -2776,7 +2858,7 @@ def refresh_mailbox_token_keepalive(mailbox):
     now_ts = utc_now()
     mailbox_id = mailbox["id"]
     try:
-        oauth_access_token_for_mailbox(mailbox, allow_fallback=True)
+        oauth_access_token_for_mailbox(mailbox, allow_fallback=True, allow_cached=False)
     except TokenRefreshError as exc:
         next_ts = now_ts + TOKEN_REFRESH_BACKOFF_SEC
         set_token_error(mailbox_id, f"{exc.kind}: {exc}", status="warning", next_refresh_at=next_ts)
