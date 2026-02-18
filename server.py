@@ -4,6 +4,7 @@
 import email
 import html
 import imaplib
+import json
 import os
 import re
 import secrets
@@ -16,6 +17,7 @@ import time
 import webbrowser
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 import requests
 from flask import (
@@ -54,6 +56,84 @@ def load_env_file(path):
 load_env_file(".env")
 
 
+LANG_COOKIE = "mailadmin_lang"
+DEFAULT_LANG = "zh"
+SUPPORTED_LANGS = ("zh", "en")
+LOCALES_DIR = os.path.join(os.path.dirname(__file__), "locales")
+
+
+def load_language_packs():
+    packs = {}
+    for code in SUPPORTED_LANGS:
+        path = os.path.join(LOCALES_DIR, f"{code}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+                packs[code] = payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            packs[code] = {}
+    return packs
+
+
+def get_locale_value(locale_pack, key):
+    current = locale_pack
+    for part in key.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current if isinstance(current, str) else None
+
+
+def get_lang_from_request():
+    if not has_request_context():
+        return DEFAULT_LANG
+    code = (request.cookies.get(LANG_COOKIE, "") or "").strip().lower()
+    if code in SUPPORTED_LANGS:
+        return code
+    return DEFAULT_LANG
+
+
+def tr(key, lang=None, **kwargs):
+    code = lang
+    if not code:
+        if has_request_context():
+            code = getattr(g, "lang", DEFAULT_LANG)
+        else:
+            code = DEFAULT_LANG
+    order = [code, "en"]
+    seen = set()
+    for item in order:
+        if item in seen:
+            continue
+        seen.add(item)
+        value = get_locale_value(LANG_PACKS.get(item, {}), key)
+        if isinstance(value, str):
+            if kwargs:
+                try:
+                    return value.format(**kwargs)
+                except Exception:
+                    return value
+            return value
+    return key
+
+
+def build_page_title(title_key, **kwargs):
+    return f"{tr(title_key, **kwargs)} - MailAdmin"
+
+
+def get_lang_next_path():
+    if not has_request_context():
+        return "/"
+    if request.query_string:
+        return request.full_path
+    return request.path
+
+
+LANG_PACKS = load_language_packs()
+
+
 APP = Flask(__name__)
 APP.secret_key = os.environ.get("MAILADMIN_SECRET", secrets.token_hex(16))
 
@@ -82,7 +162,7 @@ JUNK_FOLDERS = [
 
 BASE_TEMPLATE = """
 <!doctype html>
-<html lang="en">
+<html lang="{{ current_lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -194,6 +274,20 @@ BASE_TEMPLATE = """
       background: var(--accent);
       color: white;
       box-shadow: 0 10px 20px var(--ring);
+    }
+    .lang-links {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .lang-link {
+      text-decoration: none;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .lang-link.active {
+      color: var(--accent);
     }
     .modal-backdrop {
       position: fixed;
@@ -379,20 +473,25 @@ BASE_TEMPLATE = """
       <div class="topbar-row">
         <div>
           <div class="brand">Mail<span>Admin</span></div>
-          <div class="tagline">Multi-mailbox control with HTML previews and share links.</div>
+          <div class="tagline">{{ t('base.tagline') }}</div>
         </div>
-        <div>
-          <a class="btn ghost" href="{{ url_for('index') }}">Home</a>
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <a class="btn ghost" href="{{ url_for('index') }}">{{ t('nav.home') }}</a>
+          <div class="lang-links">
+            <a class="lang-link {{ 'active' if current_lang == 'zh' else '' }}" href="{{ url_for('set_language', code='zh', next=lang_next) }}">{{ t('lang.zh') }}</a>
+            <span class="mailbox-meta">|</span>
+            <a class="lang-link {{ 'active' if current_lang == 'en' else '' }}" href="{{ url_for('set_language', code='en', next=lang_next) }}">{{ t('lang.en') }}</a>
+          </div>
         </div>
       </div>
       <div class="nav">
-        <a class="{{ 'active' if active == 'mailboxes' else '' }}" href="{{ url_for('index') }}">Mailboxes</a>
-        <a class="{{ 'active' if active == 'import' else '' }}" href="{{ url_for('import_page') }}">Import</a>
-        <a class="{{ 'active' if active == 'shares' else '' }}" href="{{ url_for('shares_page') }}">Recent shares</a>
-        <a class="{{ 'active' if active == 'docs' else '' }}" href="{{ url_for('api_docs_page') }}">API Docs</a>
-        <a class="{{ 'active' if active == 'account' else '' }}" href="{{ url_for('account_page') }}">Account</a>
+        <a class="{{ 'active' if active == 'mailboxes' else '' }}" href="{{ url_for('index') }}">{{ t('nav.mailboxes') }}</a>
+        <a class="{{ 'active' if active == 'import' else '' }}" href="{{ url_for('import_page') }}">{{ t('nav.import') }}</a>
+        <a class="{{ 'active' if active == 'shares' else '' }}" href="{{ url_for('shares_page') }}">{{ t('nav.shares') }}</a>
+        <a class="{{ 'active' if active == 'docs' else '' }}" href="{{ url_for('api_docs_page') }}">{{ t('nav.docs') }}</a>
+        <a class="{{ 'active' if active == 'account' else '' }}" href="{{ url_for('account_page') }}">{{ t('nav.account') }}</a>
         {% if show_logout %}
-        <a href="{{ url_for('logout_page') }}">Logout</a>
+        <a href="{{ url_for('logout_page') }}">{{ t('nav.logout') }}</a>
         {% endif %}
       </div>
     </div>
@@ -406,7 +505,7 @@ BASE_TEMPLATE = """
       {% endif %}
     {% endwith %}
     {{ content|safe }}
-    <div class="footer">MailAdmin local web console</div>
+    <div class="footer">{{ t('base.footer') }}</div>
   </div>
   <script>
     (function () {
@@ -431,33 +530,34 @@ INDEX_TEMPLATE = """
 <div class="card">
   <div class="section-title">
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-      <h2>Mailboxes</h2>
-      <span class="mailbox-meta">{{ mailboxes|length }} total</span>
+      <h2>{{ t('mailboxes.title') }}</h2>
+      <span class="mailbox-meta">{{ t('mailboxes.total', n=mailboxes|length) }}</span>
     </div>
-    <a class="btn secondary small" href="{{ url_for('export_mailboxes_txt') }}">Export TXT</a>
+    <a class="btn secondary small" href="{{ url_for('export_mailboxes_txt') }}">{{ t('mailboxes.export_txt') }}</a>
   </div>
   {% if not mailboxes %}
-    <p>No mailboxes yet.</p>
+    <p>{{ t('mailboxes.empty') }}</p>
   {% else %}
     {% for box in mailboxes %}
     <div class="mailbox-item">
       <div>
         <div><strong>{{ box['address'] }}</strong></div>
         <div class="mailbox-meta">
-          Auth: {{ auth_label(box) }}
-          | Added: {{ format_ts(box['created_at']) }}
-          | Token: {{ box['token_status'] or 'unknown' }}
+          {{ t('mailboxes.auth') }}: {{ auth_label(box) }}
+          | {{ t('mailboxes.added') }}: {{ format_ts(box['created_at']) }}
+          | {{ t('mailboxes.token') }}: {{ t('token.status.' ~ (box['token_status'] or 'unknown')) }}
         </div>
         {% if box['token_status'] in ['warning', 'rollback_ok', 'degraded'] and box['token_last_warning'] %}
         <div class="mailbox-meta" style="color:#a13227; margin-top:4px;">
+          {{ t('token.warning_prefix') }}:
           {{ box['token_last_warning'] }}
         </div>
         {% endif %}
       </div>
       <div style="display:flex; gap:8px; flex-wrap: wrap;">
-        <a class="btn secondary small" href="{{ url_for('view_mailbox', address=box['address']) }}">Inbox</a>
+        <a class="btn secondary small" href="{{ url_for('view_mailbox', address=box['address']) }}">{{ t('btn.inbox') }}</a>
         <form method="post" action="{{ url_for('delete_mailbox', address=box['address']) }}">
-          <button class="btn ghost small" type="submit">Delete</button>
+          <button class="btn ghost small" type="submit">{{ t('btn.delete') }}</button>
         </form>
       </div>
     </div>
@@ -468,13 +568,13 @@ INDEX_TEMPLATE = """
 
 IMPORT_TEMPLATE = """
 <div class="card">
-  <h2>Import mailboxes</h2>
-  <p>Format per line: Address----Password----ClientID----OAuth2Token</p>
-  <p>If ClientID is empty, OAuth2Token is treated as an access token.</p>
+  <h2>{{ t('import.title') }}</h2>
+  <p>{{ t('import.format') }}</p>
+  <p>{{ t('import.client_id_note') }}</p>
   <form method="post" action="{{ url_for('import_mailboxes') }}">
-    <textarea name="payload" placeholder="user@example.com----password----client-id----refresh-token"></textarea>
+    <textarea name="payload" placeholder="{{ t('import.placeholder') }}"></textarea>
     <div style="margin-top: 12px;">
-      <button class="btn" type="submit">Import</button>
+      <button class="btn" type="submit">{{ t('btn.import') }}</button>
     </div>
   </form>
 </div>
@@ -483,24 +583,24 @@ IMPORT_TEMPLATE = """
 SHARES_TEMPLATE = """
 <div class="card">
   <div class="section-title">
-    <h2>Recent shares</h2>
-    <span class="mailbox-meta">{{ shares|length }} shown</span>
+    <h2>{{ t('shares.title') }}</h2>
+    <span class="mailbox-meta">{{ t('shares.shown', n=shares|length) }}</span>
   </div>
   {% if not shares %}
-    <p>No shares yet.</p>
+    <p>{{ t('shares.empty') }}</p>
   {% else %}
     {% for share in shares %}
       <div class="mailbox-item">
         <div>
-          <div><strong>{{ share['subject'] or '(No subject)' }}</strong></div>
+          <div><strong>{{ share['subject'] or t('common.no_subject') }}</strong></div>
           <div class="mailbox-meta">
             {{ share['code'] }} | {{ share['mail_from'] }} | {{ format_ts(share['created_at']) }}
           </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap: wrap;">
-          <a class="btn small" href="{{ url_for('view_share', code=share['code']) }}">Open</a>
+          <a class="btn small" href="{{ url_for('view_share', code=share['code']) }}">{{ t('btn.open') }}</a>
           <form method="post" action="{{ url_for('delete_share', code=share['code']) }}">
-            <button class="btn ghost small" type="submit">Revoke</button>
+            <button class="btn ghost small" type="submit">{{ t('btn.revoke') }}</button>
           </form>
         </div>
       </div>
@@ -513,35 +613,35 @@ MAILBOX_TEMPLATE = """
 <div class="card">
   <div class="section-title">
     <h2>{{ mailbox['address'] }}</h2>
-    <span class="mailbox-meta">Showing {{ messages|length }} message(s) | Inbox + Junk</span>
+    <span class="mailbox-meta">{{ t('mailbox.showing', n=messages|length) }}</span>
   </div>
   {% if mailbox['token_status'] in ['warning', 'rollback_ok', 'degraded'] and mailbox['token_last_warning'] %}
-    <p style="color:#a13227;">Token warning: {{ mailbox['token_last_warning'] }}</p>
+    <p style="color:#a13227;">{{ t('token.warning_prefix') }}: {{ mailbox['token_last_warning'] }}</p>
   {% endif %}
-  <p class="mailbox-meta">Token status: {{ mailbox['token_status'] or 'unknown' }}</p>
+  <p class="mailbox-meta">{{ t('token.status_label') }}: {{ t('token.status.' ~ (mailbox['token_status'] or 'unknown')) }}</p>
   <form method="get" class="toolbar">
     <div style="display:flex; align-items:center; gap:8px;">
-      <label for="limit">Limit</label>
+      <label for="limit">{{ t('mailbox.limit') }}</label>
       <input id="limit" type="number" name="limit" min="1" max="{{ max_limit }}" value="{{ limit }}">
     </div>
-    <button class="btn secondary small" type="submit">Refresh</button>
-    <a class="btn ghost small" href="{{ url_for('index') }}">Back</a>
+    <button class="btn secondary small" type="submit">{{ t('btn.refresh') }}</button>
+    <a class="btn ghost small" href="{{ url_for('index') }}">{{ t('btn.back') }}</a>
   </form>
 </div>
 <div class="card" style="margin-top: 16px;">
   {% if error %}
     <p>{{ error }}</p>
   {% elif not messages %}
-    <p>No messages found.</p>
+    <p>{{ t('mailbox.empty') }}</p>
   {% else %}
     <div class="message-list">
       {% for msg in messages %}
       <a class="message-item" href="{{ url_for('view_message', address=mailbox['address'], uid=msg['uid'], folder=msg['folder']) }}">
         <div>
-          <div class="message-subject">{{ msg['subject'] or '(No subject)' }}</div>
-          <div class="message-meta">{{ msg['mail_from'] }} | {{ msg['mail_dt'] }} | {{ msg['folder_label'] }}</div>
+          <div class="message-subject">{{ msg['subject'] or t('common.no_subject') }}</div>
+          <div class="message-meta">{{ msg['mail_from'] }} | {{ msg['mail_dt'] }} | {{ t('folder.' ~ (msg['folder_label']|lower)) }}</div>
         </div>
-        <div class="message-meta">View</div>
+        <div class="message-meta">{{ t('btn.view') }}</div>
       </a>
       {% endfor %}
     </div>
@@ -552,20 +652,20 @@ MAILBOX_TEMPLATE = """
 MESSAGE_TEMPLATE = """
 <div class="card">
   <div class="section-title">
-    <h2>{{ message['subject'] or '(No subject)' }}</h2>
+    <h2>{{ message['subject'] or t('common.no_subject') }}</h2>
     <span class="mailbox-meta">{{ mailbox['address'] }}</span>
   </div>
   <div class="mailbox-meta">
-    From: {{ message['mail_from'] or '-' }}<br>
-    To: {{ message['mail_to'] or '-' }}<br>
-    Date: {{ message['mail_dt'] or '-' }}<br>
-    Folder: {{ message['folder_label'] or '-' }}
+    {{ t('mail.from') }}: {{ message['mail_from'] or '-' }}<br>
+    {{ t('mail.to') }}: {{ message['mail_to'] or '-' }}<br>
+    {{ t('mail.date') }}: {{ message['mail_dt'] or '-' }}<br>
+    {{ t('mail.folder') }}: {{ t('folder.' ~ ((message['folder_label'] or 'inbox')|lower)) }}
   </div>
   <div style="display:flex; gap:8px; flex-wrap: wrap; margin-top: 12px;">
     <form method="post" action="{{ url_for('share_message', address=mailbox['address'], uid=message['uid'], folder=message['folder']) }}">
-      <button class="btn secondary small" type="submit">Create share link</button>
+      <button class="btn secondary small" type="submit">{{ t('btn.create_share') }}</button>
     </form>
-    <a class="btn ghost small" href="{{ url_for('view_mailbox', address=mailbox['address']) }}">Back</a>
+    <a class="btn ghost small" href="{{ url_for('view_mailbox', address=mailbox['address']) }}">{{ t('btn.back') }}</a>
   </div>
 </div>
 <div class="card" style="margin-top: 16px;">
@@ -582,14 +682,14 @@ MESSAGE_TEMPLATE = """
 SHARE_TEMPLATE = """
 <div class="card">
   <div class="section-title">
-    <h2>{{ share['subject'] or '(No subject)' }}</h2>
-    <span class="mailbox-meta">Shared mail</span>
+    <h2>{{ share['subject'] or t('common.no_subject') }}</h2>
+    <span class="mailbox-meta">{{ t('share.shared_mail') }}</span>
   </div>
   <div class="mailbox-meta">
-    From: {{ share['mail_from'] or '-' }}<br>
-    To: {{ share['mail_to'] or '-' }}<br>
-    Date: {{ share['mail_dt'] or '-' }}<br>
-    Code: {{ share['code'] }}
+    {{ t('mail.from') }}: {{ share['mail_from'] or '-' }}<br>
+    {{ t('mail.to') }}: {{ share['mail_to'] or '-' }}<br>
+    {{ t('mail.date') }}: {{ share['mail_dt'] or '-' }}<br>
+    {{ t('share.code') }}: {{ share['code'] }}
   </div>
 </div>
 <div class="card" style="margin-top: 16px;">
@@ -601,27 +701,35 @@ SHARE_TEMPLATE = """
 
 LOGIN_TEMPLATE = """
 <div class="card">
-  <h2>Login or Register</h2>
-  <p>{{ message or 'Please login with your API key or register to get a new one.' }}</p>
+  <h2>{{ t('login.title') }}</h2>
+  <p>{{ message or t('login.default_prompt') }}</p>
   <div style="display:grid; gap:12px;">
-    <input id="apiKeyInput" placeholder="API Key">
+    <input id="apiKeyInput" placeholder="{{ t('login.api_key_placeholder') }}">
     <div style="display:flex; gap:8px; flex-wrap: wrap;">
-      <button class="btn" type="button" id="loginBtn">Login</button>
-      <button class="btn secondary" type="button" id="registerBtn">Register</button>
+      <button class="btn" type="button" id="loginBtn">{{ t('btn.login') }}</button>
+      <button class="btn secondary" type="button" id="registerBtn">{{ t('btn.register') }}</button>
     </div>
     <div id="loginStatus" class="mailbox-meta"></div>
   </div>
 </div>
 <div id="keyModal" class="modal-backdrop" style="display:none;">
   <div class="modal-card">
-    <h2>Save your API key</h2>
-    <p>Please save this key safely. You will need it to log in.</p>
+    <h2>{{ t('login.save_key_title') }}</h2>
+    <p>{{ t('login.save_key_desc') }}</p>
     <div class="key-box" id="keyBox"></div>
-    <button class="btn" type="button" id="confirmKeyBtn">I have saved it</button>
+    <button class="btn" type="button" id="confirmKeyBtn">{{ t('btn.saved') }}</button>
   </div>
 </div>
 <script>
   (function () {
+    var I18N = {{ {
+      "requiredApiKey": t("login.required_api_key"),
+      "checking": t("login.checking"),
+      "loginFailed": t("login.login_failed"),
+      "loggedIn": t("login.logged_in"),
+      "creatingApiKey": t("login.creating_api_key"),
+      "registerFailed": t("login.register_failed")
+    } | tojson }};
     var input = document.getElementById("apiKeyInput");
     var status = document.getElementById("loginStatus");
     var keyModal = document.getElementById("keyModal");
@@ -641,10 +749,10 @@ LOGIN_TEMPLATE = """
     async function login() {
       var key = input.value.trim();
       if (!key) {
-        status.textContent = "API key is required.";
+        status.textContent = I18N.requiredApiKey;
         return;
       }
-      status.textContent = "Checking...";
+      status.textContent = I18N.checking;
       var resp = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -652,19 +760,19 @@ LOGIN_TEMPLATE = """
       });
       var data = await resp.json().catch(function () { return {}; });
       if (!data.ok) {
-        status.textContent = data.error || "Login failed.";
+        status.textContent = data.error || I18N.loginFailed;
         return;
       }
       saveKey(key);
-      status.textContent = "Logged in.";
+      status.textContent = I18N.loggedIn;
       window.location.href = "/";
     }
     async function register() {
-      status.textContent = "Creating API key...";
+      status.textContent = I18N.creatingApiKey;
       var resp = await fetch("/api/auth/register", { method: "POST" });
       var data = await resp.json().catch(function () { return {}; });
       if (!data.ok) {
-        status.textContent = data.error || "Register failed.";
+        status.textContent = data.error || I18N.registerFailed;
         return;
       }
       pendingKey = data.data.api_key;
@@ -686,23 +794,27 @@ LOGIN_TEMPLATE = """
 
 ACCOUNT_TEMPLATE = """
 <div class="card">
-  <h2>Account</h2>
-  <p>Rotate your API key to invalidate the old one. Save the new key safely.</p>
+  <h2>{{ t('account.title') }}</h2>
+  <p>{{ t('account.desc') }}</p>
   <div style="display:flex; gap:8px; flex-wrap: wrap;">
-    <button class="btn secondary" type="button" id="rotateBtn">Rotate API Key</button>
+    <button class="btn secondary" type="button" id="rotateBtn">{{ t('btn.rotate_api_key') }}</button>
   </div>
   <div id="rotateStatus" class="mailbox-meta" style="margin-top: 12px;"></div>
 </div>
 <div id="rotateModal" class="modal-backdrop" style="display:none;">
   <div class="modal-card">
-    <h2>New API key</h2>
-    <p>Save this new key safely. The old key will stop working.</p>
+    <h2>{{ t('account.new_key_title') }}</h2>
+    <p>{{ t('account.new_key_desc') }}</p>
     <div class="key-box" id="rotateKeyBox"></div>
-    <button class="btn" type="button" id="confirmRotateBtn">I have saved it</button>
+    <button class="btn" type="button" id="confirmRotateBtn">{{ t('btn.saved') }}</button>
   </div>
 </div>
 <script>
   (function () {
+    var I18N = {{ {
+      "rotating": t("account.rotating"),
+      "rotateFailed": t("account.rotate_failed")
+    } | tojson }};
     var status = document.getElementById("rotateStatus");
     var modal = document.getElementById("rotateModal");
     var keyBox = document.getElementById("rotateKeyBox");
@@ -715,7 +827,7 @@ ACCOUNT_TEMPLATE = """
       document.cookie = "{{ api_key_cookie }}=" + encodeURIComponent(key) + "; path=/; max-age=31536000; SameSite=Lax";
     }
     async function rotate() {
-      status.textContent = "Rotating...";
+      status.textContent = I18N.rotating;
       var key = window.localStorage ? localStorage.getItem("api_key") : "";
       var headers = { "Content-Type": "application/json" };
       if (key) {
@@ -727,7 +839,7 @@ ACCOUNT_TEMPLATE = """
       });
       var data = await resp.json().catch(function () { return {}; });
       if (!data.ok) {
-        status.textContent = data.error || "Rotate failed.";
+        status.textContent = data.error || I18N.rotateFailed;
         return;
       }
       pendingKey = data.data.api_key;
@@ -748,8 +860,8 @@ ACCOUNT_TEMPLATE = """
 
 LOGOUT_TEMPLATE = """
 <div class="card">
-  <h2>Logging out...</h2>
-  <p>Clearing local credentials.</p>
+  <h2>{{ t('logout.title') }}</h2>
+  <p>{{ t('logout.desc') }}</p>
 </div>
 <script>
   (function () {
@@ -765,11 +877,11 @@ LOGOUT_TEMPLATE = """
 
 DOCS_TEMPLATE = """
 <!doctype html>
-<html lang="en">
+<html lang="{{ current_lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MailAdmin API Docs</title>
+  <title>{{ t('docs.page_title') }}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
   <style>
     body { margin: 0; background: #faf7f0; }
@@ -791,12 +903,34 @@ DOCS_TEMPLATE = """
       border-radius: 999px;
       font-size: 13px;
     }
+    .lang-mini {
+      display: inline-flex;
+      gap: 8px;
+      margin-right: 6px;
+    }
+    .lang-mini a {
+      border: none;
+      padding: 0;
+      border-radius: 0;
+      font-size: 13px;
+      opacity: 0.85;
+    }
+    .lang-mini a.active {
+      opacity: 1;
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
   <div class="top">
-    <div>MailAdmin API Documentation</div>
-    <a href="{{ home_url }}">Back to App</a>
+    <div>{{ t('docs.top_title') }}</div>
+    <div style="display:flex; align-items:center;">
+      <div class="lang-mini">
+        <a class="{{ 'active' if current_lang == 'zh' else '' }}" href="{{ url_for('set_language', code='zh', next=lang_next) }}">{{ t('lang.zh') }}</a>
+        <a class="{{ 'active' if current_lang == 'en' else '' }}" href="{{ url_for('set_language', code='en', next=lang_next) }}">{{ t('lang.en') }}</a>
+      </div>
+      <a href="{{ home_url }}">{{ t('btn.back_to_app') }}</a>
+    </div>
   </div>
   <div id="swagger-ui"></div>
   <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
@@ -1219,9 +1353,24 @@ def get_runtime_warning():
     return warning
 
 
+@APP.before_request
+def set_request_language():
+    g.lang = get_lang_from_request()
+
+
+@APP.context_processor
+def inject_i18n():
+    return {
+        "t": tr,
+        "current_lang": getattr(g, "lang", DEFAULT_LANG),
+        "supported_langs": SUPPORTED_LANGS,
+    }
+
+
 def render_page(title, template, **context):
     context.setdefault("api_key_cookie", API_KEY_COOKIE)
     context.setdefault("show_logout", is_logged_in())
+    context.setdefault("lang_next", get_lang_next_path())
     content = render_template_string(template, **context)
     active = context.pop("active", "")
     return render_template_string(
@@ -1230,6 +1379,7 @@ def render_page(title, template, **context):
         content=content,
         active=active,
         api_key_cookie=API_KEY_COOKIE,
+        lang_next=context.get("lang_next", "/"),
         show_logout=context.get("show_logout", False),
     )
 
@@ -1300,11 +1450,11 @@ def require_user(api=False):
     return api_key
 
 
-def render_login_page(message=None):
+def render_login_page(message_key=None):
     return render_page(
-        "Login - MailAdmin",
+        build_page_title("page.login"),
         LOGIN_TEMPLATE,
-        message=message,
+        message=tr(message_key) if message_key else "",
         active="account",
     )
 
@@ -1664,11 +1814,11 @@ def folder_label(name):
 def auth_label(box):
     if box["refresh_token"]:
         if box["client_id"]:
-            return "OAuth (refresh)"
-        return "OAuth (token)"
+            return tr("auth.oauth_refresh")
+        return tr("auth.oauth_token")
     if box["password"]:
-        return "Password"
-    return "None"
+        return tr("auth.password")
+    return tr("auth.none")
 
 
 def parse_import_payload(payload):
@@ -2137,14 +2287,31 @@ def api_docs_page():
         DOCS_TEMPLATE,
         spec_url=url_for("openapi_json"),
         home_url=url_for("index"),
+        lang_next=get_lang_next_path(),
     )
+
+
+@APP.get("/lang/<code>")
+def set_language(code):
+    lang = (code or "").strip().lower()
+    if lang not in SUPPORTED_LANGS:
+        lang = DEFAULT_LANG
+    target = "/"
+    next_url = request.args.get("next", "").strip()
+    if next_url:
+        parsed = urlparse(next_url)
+        if not parsed.scheme and not parsed.netloc and next_url.startswith("/"):
+            target = next_url
+    response = redirect(target)
+    response.set_cookie(LANG_COOKIE, lang, max_age=31536000, path="/", samesite="Lax")
+    return response
 
 
 @APP.route("/")
 def index():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login or register to continue.")
+        return render_login_page("login.require_continue")
     with get_db() as conn:
         if MULTI_USER:
             mailboxes = conn.execute(
@@ -2156,7 +2323,7 @@ def index():
                 "SELECT * FROM mailboxes ORDER BY created_at DESC"
             ).fetchall()
     return render_page(
-        "Mailboxes - MailAdmin",
+        build_page_title("page.mailboxes"),
         INDEX_TEMPLATE,
         mailboxes=mailboxes,
         format_ts=format_ts,
@@ -2169,7 +2336,7 @@ def index():
 def export_mailboxes_txt():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to export mailboxes.")
+        return render_login_page("login.require_export")
     with get_db() as conn:
         if MULTI_USER:
             rows = conn.execute(
@@ -2199,9 +2366,9 @@ def export_mailboxes_txt():
 def import_page():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to import mailboxes.")
+        return render_login_page("login.require_import")
     return render_page(
-        "Import - MailAdmin",
+        build_page_title("page.import"),
         IMPORT_TEMPLATE,
         active="import",
     )
@@ -2211,7 +2378,7 @@ def import_page():
 def shares_page():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to view shares.")
+        return render_login_page("login.require_shares")
     with get_db() as conn:
         if MULTI_USER:
             shares = conn.execute(
@@ -2223,7 +2390,7 @@ def shares_page():
                 "SELECT * FROM shares ORDER BY created_at DESC"
             ).fetchall()
     return render_page(
-        "Shares - MailAdmin",
+        build_page_title("page.shares"),
         SHARES_TEMPLATE,
         shares=shares,
         format_ts=format_ts,
@@ -2245,9 +2412,9 @@ def login_page():
 def account_page():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to manage your account.")
+        return render_login_page("login.require_account")
     return render_page(
-        "Account - MailAdmin",
+        build_page_title("page.account"),
         ACCOUNT_TEMPLATE,
         active="account",
     )
@@ -2255,7 +2422,7 @@ def account_page():
 
 @APP.route("/logout")
 def logout_page():
-    response = render_page("Logout - MailAdmin", LOGOUT_TEMPLATE, active="account")
+    response = render_page(build_page_title("page.logout"), LOGOUT_TEMPLATE, active="account")
     resp = APP.make_response(response)
     resp.set_cookie(API_KEY_COOKIE, "", max_age=0, path="/")
     return resp
@@ -2404,7 +2571,7 @@ def api_import_mailboxes():
         for err in owner_errors[:3]:
             flash(err, "error")
         if len(owner_errors) > 3:
-            flash(f"{len(owner_errors) - 3} more errors hidden.", "error")
+            flash(tr("flash.more_errors_hidden", n=len(owner_errors) - 3), "error")
     return api_ok({"imported": imported, "errors": errors})
 
 
@@ -2609,10 +2776,10 @@ def api_delete_share(code):
 def import_mailboxes():
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to import mailboxes.")
+        return render_login_page("login.require_import")
     payload = request.form.get("payload", "").strip()
     if not payload:
-        flash("Import payload is empty.", "error")
+        flash(tr("flash.import_empty"), "error")
         return redirect(url_for("index"))
 
     entries, errors = parse_import_payload(payload)
@@ -2620,7 +2787,7 @@ def import_mailboxes():
         for err in errors[:3]:
             flash(err, "error")
         if len(errors) > 3:
-            flash(f"{len(errors) - 3} more errors hidden.", "error")
+            flash(tr("flash.more_errors_hidden", n=len(errors) - 3), "error")
     if not entries:
         return redirect(url_for("index"))
 
@@ -2641,7 +2808,7 @@ def import_mailboxes():
                 errors.append(err)
                 continue
             imported += 1
-    flash(f"Imported {imported} mailbox(es).", "success")
+    flash(tr("flash.imported_n", n=imported), "success")
     return redirect(url_for("import_page"))
 
 
@@ -2649,7 +2816,7 @@ def import_mailboxes():
 def delete_mailbox(address):
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to delete mailboxes.")
+        return render_login_page("login.require_delete_mailboxes")
     with get_db() as conn:
         if MULTI_USER:
             conn.execute(
@@ -2658,7 +2825,7 @@ def delete_mailbox(address):
             )
         else:
             conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
-    flash("Mailbox deleted.", "success")
+    flash(tr("flash.mailbox_deleted"), "success")
     return redirect(url_for("index"))
 
 
@@ -2666,7 +2833,7 @@ def delete_mailbox(address):
 def view_mailbox(address):
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to view mailboxes.")
+        return render_login_page("login.require_view_mailboxes")
     limit_raw = request.args.get("limit", str(DEFAULT_LIMIT))
     try:
         limit = int(limit_raw)
@@ -2698,7 +2865,7 @@ def view_mailbox(address):
         flash(warning, "error")
 
     return render_page(
-        f"Inbox - {mailbox['address']}",
+        build_page_title("page.inbox", address=mailbox["address"]),
         MAILBOX_TEMPLATE,
         mailbox=mailbox,
         messages=messages,
@@ -2713,7 +2880,7 @@ def view_mailbox(address):
 def view_message(address, uid):
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to view messages.")
+        return render_login_page("login.require_view_messages")
     with get_db() as conn:
         if MULTI_USER:
             mailbox = conn.execute(
@@ -2739,7 +2906,7 @@ def view_message(address, uid):
 
     message["safe_body_html"] = sanitize_html(message["body_html"])
     return render_page(
-        f"Message - {mailbox['address']}",
+        build_page_title("page.message", address=mailbox["address"]),
         MESSAGE_TEMPLATE,
         mailbox=mailbox,
         message=message,
@@ -2751,7 +2918,7 @@ def view_message(address, uid):
 def share_message(address, uid):
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to share messages.")
+        return render_login_page("login.require_share_messages")
     with get_db() as conn:
         if MULTI_USER:
             mailbox = conn.execute(
@@ -2794,7 +2961,7 @@ def share_message(address, uid):
             ),
         )
 
-    flash("Share link created.", "success")
+    flash(tr("flash.share_created"), "success")
     return redirect(url_for("view_share", code=code))
 
 
@@ -2807,7 +2974,7 @@ def view_share(code):
     if not share:
         abort(404)
     return render_page(
-        f"Share - {share['code']}",
+        build_page_title("page.share", code=share["code"]),
         SHARE_TEMPLATE,
         share=share,
         active="shares",
@@ -2818,7 +2985,7 @@ def view_share(code):
 def delete_share(code):
     user_key = require_user()
     if user_key is None:
-        return render_login_page("Please login to manage shares.")
+        return render_login_page("login.require_manage_shares")
     with get_db() as conn:
         if MULTI_USER:
             conn.execute(
@@ -2827,7 +2994,7 @@ def delete_share(code):
             )
         else:
             conn.execute("DELETE FROM shares WHERE code = ?", (code,))
-    flash("Share revoked.", "success")
+    flash(tr("flash.share_revoked"), "success")
     return redirect(url_for("index"))
 
 

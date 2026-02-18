@@ -1,0 +1,153 @@
+{
+  "base": {
+    "tagline": "Multi-mailbox control with HTML previews and share links.",
+    "footer": "MailAdmin local web console"
+  },
+  "lang": {
+    "zh": "中文",
+    "en": "EN"
+  },
+  "nav": {
+    "home": "Home",
+    "mailboxes": "Mailboxes",
+    "import": "Import",
+    "shares": "Recent shares",
+    "docs": "API Docs",
+    "account": "Account",
+    "logout": "Logout"
+  },
+  "page": {
+    "mailboxes": "Mailboxes",
+    "import": "Import",
+    "shares": "Shares",
+    "login": "Login",
+    "account": "Account",
+    "logout": "Logout",
+    "inbox": "Inbox - {address}",
+    "message": "Message - {address}",
+    "share": "Share - {code}"
+  },
+  "common": {
+    "no_subject": "(No subject)"
+  },
+  "auth": {
+    "oauth_refresh": "OAuth (refresh)",
+    "oauth_token": "OAuth (token)",
+    "password": "Password",
+    "none": "None"
+  },
+  "mailboxes": {
+    "title": "Mailboxes",
+    "total": "{n} total",
+    "export_txt": "Export TXT",
+    "empty": "No mailboxes yet.",
+    "auth": "Auth",
+    "added": "Added",
+    "token": "Token"
+  },
+  "import": {
+    "title": "Import mailboxes",
+    "format": "Format per line: Address----Password----ClientID----OAuth2Token",
+    "client_id_note": "If ClientID is empty, OAuth2Token is treated as an access token.",
+    "placeholder": "user@example.com----password----client-id----refresh-token"
+  },
+  "shares": {
+    "title": "Recent shares",
+    "shown": "{n} shown",
+    "empty": "No shares yet."
+  },
+  "mailbox": {
+    "showing": "Showing {n} message(s) | Inbox + Junk",
+    "limit": "Limit",
+    "empty": "No messages found."
+  },
+  "token": {
+    "warning_prefix": "Token warning",
+    "status_label": "Token status",
+    "status": {
+      "unknown": "unknown",
+      "healthy": "healthy",
+      "pending_initial": "pending_initial",
+      "warning": "warning",
+      "rollback_ok": "rollback_ok",
+      "degraded": "degraded"
+    }
+  },
+  "mail": {
+    "from": "From",
+    "to": "To",
+    "date": "Date",
+    "folder": "Folder"
+  },
+  "folder": {
+    "inbox": "Inbox",
+    "junk": "Junk"
+  },
+  "share": {
+    "shared_mail": "Shared mail",
+    "code": "Code"
+  },
+  "login": {
+    "title": "Login or Register",
+    "default_prompt": "Please login with your API key or register to get a new one.",
+    "api_key_placeholder": "API Key",
+    "save_key_title": "Save your API key",
+    "save_key_desc": "Please save this key safely. You will need it to log in.",
+    "required_api_key": "API key is required.",
+    "checking": "Checking...",
+    "login_failed": "Login failed.",
+    "logged_in": "Logged in.",
+    "creating_api_key": "Creating API key...",
+    "register_failed": "Register failed.",
+    "require_continue": "Please login or register to continue.",
+    "require_export": "Please login to export mailboxes.",
+    "require_import": "Please login to import mailboxes.",
+    "require_shares": "Please login to view shares.",
+    "require_account": "Please login to manage your account.",
+    "require_delete_mailboxes": "Please login to delete mailboxes.",
+    "require_view_mailboxes": "Please login to view mailboxes.",
+    "require_view_messages": "Please login to view messages.",
+    "require_share_messages": "Please login to share messages.",
+    "require_manage_shares": "Please login to manage shares."
+  },
+  "account": {
+    "title": "Account",
+    "desc": "Rotate your API key to invalidate the old one. Save the new key safely.",
+    "new_key_title": "New API key",
+    "new_key_desc": "Save this new key safely. The old key will stop working.",
+    "rotating": "Rotating...",
+    "rotate_failed": "Rotate failed."
+  },
+  "logout": {
+    "title": "Logging out...",
+    "desc": "Clearing local credentials."
+  },
+  "docs": {
+    "page_title": "MailAdmin API Docs",
+    "top_title": "MailAdmin API Documentation"
+  },
+  "btn": {
+    "inbox": "Inbox",
+    "delete": "Delete",
+    "import": "Import",
+    "open": "Open",
+    "revoke": "Revoke",
+    "refresh": "Refresh",
+    "back": "Back",
+    "view": "View",
+    "create_share": "Create share link",
+    "login": "Login",
+    "register": "Register",
+    "saved": "I have saved it",
+    "rotate_api_key": "Rotate API Key",
+    "back_to_app": "Back to App"
+  },
+  "flash": {
+    "more_errors_hidden": "{n} more errors hidden.",
+    "import_empty": "Import payload is empty.",
+    "imported_n": "Imported {n} mailbox(es).",
+    "mailbox_deleted": "Mailbox deleted.",
+    "share_created": "Share link created.",
+    "share_revoked": "Share revoked."
+  }
+}
