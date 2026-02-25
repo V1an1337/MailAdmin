@@ -67,7 +67,7 @@ def load_language_packs():
     for code in SUPPORTED_LANGS:
         path = os.path.join(LOCALES_DIR, f"{code}.json")
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8-sig") as handle:
                 payload = json.load(handle)
                 packs[code] = payload if isinstance(payload, dict) else {}
         except (OSError, ValueError):
@@ -422,6 +422,51 @@ BASE_TEMPLATE = """
       gap: 12px;
       align-items: center;
     }
+    .pagination-wrap {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    .pagination {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .page-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      border: 1px solid rgba(28, 27, 25, 0.15);
+      background: rgba(255, 255, 255, 0.75);
+      color: var(--ink);
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 0 8px;
+    }
+    .page-link.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: transparent;
+      box-shadow: 0 10px 20px var(--ring);
+    }
+    .page-link.muted {
+      opacity: 0.4;
+      pointer-events: none;
+    }
+    .page-ellipsis {
+      color: var(--muted);
+      font-weight: 600;
+      padding: 0 4px;
+    }
     .message-list { display: grid; gap: 12px; }
     .message-item {
       text-decoration: none;
@@ -531,9 +576,14 @@ INDEX_TEMPLATE = """
   <div class="section-title">
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
       <h2>{{ t('mailboxes.title') }}</h2>
-      <span class="mailbox-meta">{{ t('mailboxes.total', n=mailboxes|length) }}</span>
+      <span class="mailbox-meta">{{ t('mailboxes.total', n=total_mailboxes) }}</span>
     </div>
-    <a class="btn secondary small" href="{{ url_for('export_mailboxes_txt') }}">{{ t('mailboxes.export_txt') }}</a>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <a class="btn secondary small" href="{{ url_for('export_mailboxes_txt') }}">{{ t('mailboxes.export_all') }}</a>
+      <form method="post" action="{{ url_for('delete_bad_token_mailboxes') }}" onsubmit="return confirm('{{ t('mailboxes.delete_bad_tokens_confirm') }}');">
+        <button class="btn ghost small" type="submit">{{ t('mailboxes.delete_bad_tokens') }}</button>
+      </form>
+    </div>
   </div>
   {% if not mailboxes %}
     <p>{{ t('mailboxes.empty') }}</p>
@@ -563,6 +613,59 @@ INDEX_TEMPLATE = """
     </div>
     {% endfor %}
   {% endif %}
+  <div class="pagination-wrap">
+    <form method="get" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <label for="per_page">{{ t('mailboxes.per_page') }}</label>
+      <select id="per_page" name="per_page" onchange="this.form.submit()">
+        {% for option in per_page_options %}
+          <option value="{{ option }}" {{ 'selected' if option == per_page else '' }}>{{ option }}</option>
+        {% endfor %}
+      </select>
+      <input type="hidden" name="page" value="1">
+      <span class="mailbox-meta">{{ t('mailboxes.page_info', page=current_page, total_pages=total_pages) }}</span>
+    </form>
+    <div class="pagination">
+      <a
+        class="page-link {{ 'muted' if current_page <= 1 else '' }}"
+        href="{{ url_for('index', page=1, per_page=per_page) }}"
+        title="{{ t('btn.first_page') }}"
+      >&laquo;</a>
+      <a
+        class="page-link {{ 'muted' if current_page <= 1 else '' }}"
+        href="{{ url_for('index', page=prev_page, per_page=per_page) }}"
+        title="{{ t('btn.prev_page') }}"
+      >&lsaquo;</a>
+      {% for item in page_items %}
+        {% if item == '...' %}
+          <span class="page-ellipsis">...</span>
+        {% else %}
+          <a
+            class="page-link {{ 'active' if item == current_page else '' }}"
+            href="{{ url_for('index', page=item, per_page=per_page) }}"
+          >{{ item }}</a>
+        {% endif %}
+      {% endfor %}
+      <a
+        class="page-link {{ 'muted' if current_page >= total_pages else '' }}"
+        href="{{ url_for('index', page=next_page, per_page=per_page) }}"
+        title="{{ t('btn.next_page') }}"
+      >&rsaquo;</a>
+      <a
+        class="page-link {{ 'muted' if current_page >= total_pages else '' }}"
+        href="{{ url_for('index', page=total_pages, per_page=per_page) }}"
+        title="{{ t('btn.last_page') }}"
+      >&raquo;</a>
+      <form method="get" style="display:inline-flex; align-items:center; gap:6px; margin-left:6px;">
+        <input type="hidden" name="per_page" value="{{ per_page }}">
+        <label for="jump_page" class="mailbox-meta">{{ t('mailboxes.jump_to') }}</label>
+        <select id="jump_page" name="page" onchange="this.form.submit()">
+          {% for p in page_select_options %}
+            <option value="{{ p }}" {{ 'selected' if p == current_page else '' }}>{{ p }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    </div>
+  </div>
 </div>
 """
 
@@ -1811,6 +1914,25 @@ def folder_label(name):
     return "Junk"
 
 
+def build_page_items(current_page, total_pages):
+    if total_pages <= 7:
+        return list(range(1, total_pages + 1))
+    left = max(1, current_page - 2)
+    right = min(total_pages, current_page + 2)
+    items = []
+    if left > 1:
+        items.append(1)
+    if left > 2:
+        items.append("...")
+    for page in range(left, right + 1):
+        items.append(page)
+    if right < total_pages - 1:
+        items.append("...")
+    if right < total_pages:
+        items.append(total_pages)
+    return items
+
+
 def auth_label(box):
     if box["refresh_token"]:
         if box["client_id"]:
@@ -2312,20 +2434,73 @@ def index():
     user_key = require_user()
     if user_key is None:
         return render_login_page("login.require_continue")
+    per_page_options = (20, 50, 100)
+    per_page_raw = (request.args.get("per_page", "20") or "").strip()
+    page_raw = (request.args.get("page", "1") or "").strip()
+    try:
+        per_page = int(per_page_raw)
+    except ValueError:
+        per_page = 20
+    if per_page not in per_page_options:
+        per_page = 20
+    try:
+        current_page = int(page_raw)
+    except ValueError:
+        current_page = 1
+    current_page = max(1, current_page)
+
     with get_db() as conn:
         if MULTI_USER:
+            total_mailboxes = int(
+                conn.execute(
+                    "SELECT COUNT(1) FROM mailboxes WHERE owner_key = ?",
+                    (user_key,),
+                ).fetchone()[0]
+            )
+        else:
+            total_mailboxes = int(
+                conn.execute("SELECT COUNT(1) FROM mailboxes").fetchone()[0]
+            )
+
+        total_pages = max(1, (total_mailboxes + per_page - 1) // per_page)
+        if current_page > total_pages:
+            current_page = total_pages
+        prev_page = current_page - 1 if current_page > 1 else 1
+        next_page = current_page + 1 if current_page < total_pages else total_pages
+        offset = (current_page - 1) * per_page
+
+        if MULTI_USER:
             mailboxes = conn.execute(
-                "SELECT * FROM mailboxes WHERE owner_key = ? ORDER BY created_at DESC",
-                (user_key,),
+                """
+                SELECT * FROM mailboxes
+                WHERE owner_key = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_key, per_page, offset),
             ).fetchall()
         else:
             mailboxes = conn.execute(
-                "SELECT * FROM mailboxes ORDER BY created_at DESC"
+                """
+                SELECT * FROM mailboxes
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (per_page, offset),
             ).fetchall()
     return render_page(
         build_page_title("page.mailboxes"),
         INDEX_TEMPLATE,
         mailboxes=mailboxes,
+        total_mailboxes=total_mailboxes,
+        total_pages=total_pages,
+        current_page=current_page,
+        prev_page=prev_page,
+        next_page=next_page,
+        page_items=build_page_items(current_page, total_pages),
+        page_select_options=list(range(1, total_pages + 1)),
+        per_page=per_page,
+        per_page_options=per_page_options,
         format_ts=format_ts,
         auth_label=auth_label,
         active="mailboxes",
@@ -2826,6 +3001,61 @@ def delete_mailbox(address):
         else:
             conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
     flash(tr("flash.mailbox_deleted"), "success")
+    return redirect(url_for("index"))
+
+
+@APP.post("/mailboxes/delete-token-unhealthy")
+def delete_bad_token_mailboxes():
+    user_key = require_user()
+    if user_key is None:
+        return render_login_page("login.require_delete_mailboxes")
+    bad_statuses = ("warning", "degraded")
+    with get_db() as conn:
+        if MULTI_USER:
+            count_row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM mailboxes
+                WHERE owner_key = ?
+                  AND client_id != ''
+                  AND refresh_token != ''
+                  AND token_status IN (?, ?)
+                """,
+                (user_key, *bad_statuses),
+            ).fetchone()
+            deleted_count = int(count_row[0] or 0)
+            conn.execute(
+                """
+                DELETE FROM mailboxes
+                WHERE owner_key = ?
+                  AND client_id != ''
+                  AND refresh_token != ''
+                  AND token_status IN (?, ?)
+                """,
+                (user_key, *bad_statuses),
+            )
+        else:
+            count_row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM mailboxes
+                WHERE client_id != ''
+                  AND refresh_token != ''
+                  AND token_status IN (?, ?)
+                """,
+                bad_statuses,
+            ).fetchone()
+            deleted_count = int(count_row[0] or 0)
+            conn.execute(
+                """
+                DELETE FROM mailboxes
+                WHERE client_id != ''
+                  AND refresh_token != ''
+                  AND token_status IN (?, ?)
+                """,
+                bad_statuses,
+            )
+    flash(tr("flash.bad_token_mailboxes_deleted_n", n=deleted_count), "success")
     return redirect(url_for("index"))
 
 
