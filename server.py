@@ -1069,34 +1069,180 @@ def get_db():
     return conn
 
 
+def table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def create_mailboxes_table(conn, table_name="mailboxes"):
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT NOT NULL,
+            password TEXT NOT NULL DEFAULT '',
+            client_id TEXT NOT NULL DEFAULT '',
+            refresh_token TEXT NOT NULL DEFAULT '',
+            access_token_cached TEXT NOT NULL DEFAULT '',
+            access_token_expires_at INTEGER NOT NULL DEFAULT 0,
+            refresh_token_prev TEXT NOT NULL DEFAULT '',
+            refresh_token_updated_at INTEGER NOT NULL DEFAULT 0,
+            refresh_token_prev_updated_at INTEGER NOT NULL DEFAULT 0,
+            refresh_token_expires_at INTEGER NOT NULL DEFAULT 0,
+            token_next_refresh_at INTEGER NOT NULL DEFAULT 0,
+            token_refresh_priority INTEGER NOT NULL DEFAULT 0,
+            token_status TEXT NOT NULL DEFAULT 'unknown',
+            token_last_error TEXT NOT NULL DEFAULT '',
+            token_last_error_at INTEGER NOT NULL DEFAULT 0,
+            token_last_warning TEXT NOT NULL DEFAULT '',
+            owner_key TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(address, client_id)
+        )
+        """
+    )
+
+
+def create_mailbox_users_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mailbox_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_key TEXT NOT NULL,
+            mailbox_id INTEGER NOT NULL,
+            mailbox_address TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(owner_key, mailbox_id),
+            UNIQUE(owner_key, mailbox_address)
+        )
+        """
+    )
+
+
+def create_app_meta_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def get_meta(conn, key, default=""):
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if not row:
+        return default
+    return row["value"]
+
+
+def set_meta(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def mailboxes_have_shared_identity_index(conn):
+    rows = conn.execute("PRAGMA index_list(mailboxes)").fetchall()
+    for row in rows:
+        unique_flag = row["unique"] if isinstance(row, sqlite3.Row) else row[2]
+        if not unique_flag:
+            continue
+        index_name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        cols = [
+            info["name"] if isinstance(info, sqlite3.Row) else info[2]
+            for info in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        ]
+        if cols == ["address", "client_id"]:
+            return True
+    return False
+
+
+def rebuild_mailboxes_for_shared_identity(conn):
+    backup_name = "mailboxes_old"
+    suffix = 1
+    while table_exists(conn, backup_name):
+        backup_name = f"mailboxes_old_{suffix}"
+        suffix += 1
+
+    conn.execute("DROP TABLE IF EXISTS mailboxes_new")
+    create_mailboxes_table(conn, "mailboxes_new")
+    conn.execute(
+        """
+        INSERT INTO mailboxes_new (
+            id, address, password, client_id, refresh_token, access_token_cached,
+            access_token_expires_at, refresh_token_prev, refresh_token_updated_at,
+            refresh_token_prev_updated_at, refresh_token_expires_at, token_next_refresh_at,
+            token_refresh_priority, token_status, token_last_error, token_last_error_at,
+            token_last_warning, owner_key, created_at, updated_at
+        )
+        SELECT
+            id, address, password, client_id, refresh_token, access_token_cached,
+            access_token_expires_at, refresh_token_prev, refresh_token_updated_at,
+            refresh_token_prev_updated_at, refresh_token_expires_at, token_next_refresh_at,
+            token_refresh_priority, token_status, token_last_error, token_last_error_at,
+            token_last_warning, owner_key, created_at, updated_at
+        FROM mailboxes
+        """
+    )
+    conn.execute(f"ALTER TABLE mailboxes RENAME TO {backup_name}")
+    conn.execute("ALTER TABLE mailboxes_new RENAME TO mailboxes")
+
+
+def migrate_mailbox_user_bindings(conn):
+    create_mailbox_users_table(conn)
+    owner_expr = "owner_key" if MULTI_USER else "''"
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO mailbox_users (
+            owner_key, mailbox_id, mailbox_address, created_at, updated_at
+        )
+        SELECT
+            {owner_expr},
+            id,
+            address,
+            created_at,
+            updated_at
+        FROM mailboxes
+        """
+    )
+
+
+def ensure_mailbox_indexes(conn):
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mailboxes_token_next_refresh_at ON mailboxes(token_next_refresh_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mailboxes_refresh_token_updated_at ON mailboxes(refresh_token_updated_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_users_owner_created_at ON mailbox_users(owner_key, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_users_mailbox_id ON mailbox_users(mailbox_id)"
+    )
+
+
 def init_db():
     with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mailboxes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                address TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL DEFAULT '',
-                client_id TEXT NOT NULL DEFAULT '',
-                refresh_token TEXT NOT NULL DEFAULT '',
-                access_token_cached TEXT NOT NULL DEFAULT '',
-                access_token_expires_at INTEGER NOT NULL DEFAULT 0,
-                refresh_token_prev TEXT NOT NULL DEFAULT '',
-                refresh_token_updated_at INTEGER NOT NULL DEFAULT 0,
-                refresh_token_prev_updated_at INTEGER NOT NULL DEFAULT 0,
-                refresh_token_expires_at INTEGER NOT NULL DEFAULT 0,
-                token_next_refresh_at INTEGER NOT NULL DEFAULT 0,
-                token_refresh_priority INTEGER NOT NULL DEFAULT 0,
-                token_status TEXT NOT NULL DEFAULT 'unknown',
-                token_last_error TEXT NOT NULL DEFAULT '',
-                token_last_error_at INTEGER NOT NULL DEFAULT 0,
-                token_last_warning TEXT NOT NULL DEFAULT '',
-                owner_key TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-            """
-        )
+        create_app_meta_table(conn)
+        if not table_exists(conn, "mailboxes"):
+            create_mailboxes_table(conn)
+            set_meta(conn, "mailboxes_shared_identity_v1", "done")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS shares (
@@ -1120,6 +1266,7 @@ def init_db():
             )
             """
         )
+        create_mailbox_users_table(conn)
         ensure_column(conn, "mailboxes", "owner_key", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "mailboxes", "access_token_cached", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "mailboxes", "access_token_expires_at", "INTEGER NOT NULL DEFAULT 0")
@@ -1134,6 +1281,12 @@ def init_db():
         ensure_column(conn, "mailboxes", "token_last_error_at", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "mailboxes", "token_last_warning", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "shares", "owner_key", "TEXT NOT NULL DEFAULT ''")
+        if not mailboxes_have_shared_identity_index(conn):
+            rebuild_mailboxes_for_shared_identity(conn)
+        set_meta(conn, "mailboxes_shared_identity_v1", "done")
+        migrate_mailbox_user_bindings(conn)
+        set_meta(conn, "mailbox_users_v1", "done")
+        ensure_mailbox_indexes(conn)
 
 
 def ensure_column(conn, table, column, column_type):
@@ -1501,6 +1654,144 @@ def row_to_dict(row):
     if row is None:
         return None
     return dict(row)
+
+
+def normalize_address(address):
+    return str(address or "").replace("\r", " ").replace("\n", " ").strip()
+
+
+def scoped_owner_key(owner_key):
+    return owner_key if MULTI_USER else ""
+
+
+USER_MAILBOX_SELECT = """
+SELECT
+    m.*
+FROM mailbox_users mu
+JOIN mailboxes m ON m.id = mu.mailbox_id
+"""
+
+
+def get_user_mailbox(conn, owner_key, address):
+    return conn.execute(
+        USER_MAILBOX_SELECT
+        + """
+        WHERE mu.owner_key = ? AND mu.mailbox_address = ?
+        LIMIT 1
+        """,
+        (scoped_owner_key(owner_key), normalize_address(address)),
+    ).fetchone()
+
+
+def list_user_mailboxes(conn, owner_key, limit=None, offset=0):
+    owner_value = scoped_owner_key(owner_key)
+    if limit is None:
+        return conn.execute(
+            USER_MAILBOX_SELECT
+            + """
+            WHERE mu.owner_key = ?
+            ORDER BY mu.created_at DESC, mu.id DESC
+            """,
+            (owner_value,),
+        ).fetchall()
+    return conn.execute(
+        USER_MAILBOX_SELECT
+        + """
+        WHERE mu.owner_key = ?
+        ORDER BY mu.created_at DESC, mu.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (owner_value, limit, offset),
+    ).fetchall()
+
+
+def count_user_mailboxes(conn, owner_key):
+    row = conn.execute(
+        "SELECT COUNT(1) AS cnt FROM mailbox_users WHERE owner_key = ?",
+        (scoped_owner_key(owner_key),),
+    ).fetchone()
+    return int((row["cnt"] if row else 0) or 0)
+
+
+def find_shared_mailbox(conn, address, client_id):
+    return conn.execute(
+        """
+        SELECT *
+        FROM mailboxes
+        WHERE address = ? AND client_id = ?
+        LIMIT 1
+        """,
+        (normalize_address(address), str(client_id or "").strip()),
+    ).fetchone()
+
+
+def bind_user_mailbox(conn, owner_key, mailbox_id, address, now_ts):
+    owner_value = scoped_owner_key(owner_key)
+    norm_address = normalize_address(address)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO mailbox_users (
+            owner_key, mailbox_id, mailbox_address, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (owner_value, mailbox_id, norm_address, now_ts, now_ts),
+    )
+    conn.execute(
+        """
+        UPDATE mailbox_users
+        SET updated_at = ?, mailbox_address = ?
+        WHERE owner_key = ? AND mailbox_id = ?
+        """,
+        (now_ts, norm_address, owner_value, mailbox_id),
+    )
+
+
+def unbind_user_mailbox(conn, owner_key, address):
+    row = conn.execute(
+        """
+        SELECT mailbox_id
+        FROM mailbox_users
+        WHERE owner_key = ? AND mailbox_address = ?
+        LIMIT 1
+        """,
+        (scoped_owner_key(owner_key), normalize_address(address)),
+    ).fetchone()
+    if not row:
+        return None
+    mailbox_id = int(row["mailbox_id"])
+    conn.execute(
+        """
+        DELETE FROM mailbox_users
+        WHERE owner_key = ? AND mailbox_address = ?
+        """,
+        (scoped_owner_key(owner_key), normalize_address(address)),
+    )
+    return mailbox_id
+
+
+def delete_mailbox_if_unbound(conn, mailbox_id):
+    row = conn.execute(
+        "SELECT COUNT(1) AS cnt FROM mailbox_users WHERE mailbox_id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    if int((row["cnt"] if row else 0) or 0) > 0:
+        return False
+    conn.execute("DELETE FROM mailboxes WHERE id = ?", (mailbox_id,))
+    return True
+
+
+def list_export_mailboxes(conn, owner_key):
+    return conn.execute(
+        """
+        SELECT m.address, m.password, m.client_id, m.refresh_token
+        FROM mailbox_users mu
+        JOIN mailboxes m ON m.id = mu.mailbox_id
+        WHERE mu.owner_key = ?
+        ORDER BY mu.created_at DESC, mu.id DESC
+        """,
+        (scoped_owner_key(owner_key),),
+    ).fetchall()
 
 
 def get_api_key():
@@ -1973,59 +2264,18 @@ def export_mailboxes_text(rows):
     return "\n".join(lines)
 
 
-def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token, owner_key, now_ts):
-    existing = conn.execute(
-        "SELECT * FROM mailboxes WHERE address = ?",
-        (address,),
-    ).fetchone()
-    if existing and MULTI_USER and existing["owner_key"] not in ("", owner_key):
-        return False, f"Address {address} already owned by another user."
-
-    owner_value = owner_key if MULTI_USER else ""
+def import_token_state(client_id, refresh_token, now_ts):
     needs_priority = mailbox_needs_priority_refresh(client_id, refresh_token)
-    token_status = "pending_initial" if needs_priority else "unknown"
-    token_refresh_priority = 1 if needs_priority else 0
-    token_next_refresh_at = now_ts if needs_priority else 0
+    return {
+        "token_status": "pending_initial" if needs_priority else "unknown",
+        "token_refresh_priority": 1 if needs_priority else 0,
+        "token_next_refresh_at": now_ts if needs_priority else 0,
+    }
 
-    refresh_token_prev = ""
-    refresh_token_prev_updated_at = 0
-    if existing:
-        refresh_token_prev = existing["refresh_token_prev"] or ""
-        refresh_token_prev_updated_at = int(existing["refresh_token_prev_updated_at"] or 0)
-        old_token = (existing["refresh_token"] or "").strip()
-        new_token = (refresh_token or "").strip()
-        if old_token and new_token and old_token != new_token:
-            refresh_token_prev = old_token
-            refresh_token_prev_updated_at = now_ts
-        conn.execute(
-            """
-            UPDATE mailboxes
-            SET password = ?, client_id = ?, refresh_token = ?, refresh_token_prev = ?,
-                refresh_token_prev_updated_at = ?, refresh_token_updated_at = 0,
-                access_token_cached = '', access_token_expires_at = 0,
-                refresh_token_expires_at = 0, token_status = ?, token_last_error = '',
-                token_last_error_at = 0, token_last_warning = '',
-                token_refresh_priority = ?, token_next_refresh_at = ?,
-                owner_key = ?, updated_at = ?
-            WHERE address = ?
-            """,
-            (
-                password,
-                client_id,
-                refresh_token,
-                refresh_token_prev,
-                refresh_token_prev_updated_at,
-                token_status,
-                token_refresh_priority,
-                token_next_refresh_at,
-                owner_value,
-                now_ts,
-                address,
-            ),
-        )
-        return True, None
 
-    conn.execute(
+def create_shared_mailbox_from_import(conn, address, password, client_id, refresh_token, now_ts):
+    token_state = import_token_state(client_id, refresh_token, now_ts)
+    cursor = conn.execute(
         """
         INSERT INTO mailboxes (
             address, password, client_id, refresh_token, access_token_cached,
@@ -2038,7 +2288,7 @@ def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            address,
+            normalize_address(address),
             password,
             client_id,
             refresh_token,
@@ -2048,17 +2298,116 @@ def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token
             0,
             0,
             0,
-            token_next_refresh_at,
-            token_refresh_priority,
-            token_status,
+            token_state["token_next_refresh_at"],
+            token_state["token_refresh_priority"],
+            token_state["token_status"],
             "",
             0,
             "",
-            owner_value,
+            "",
             now_ts,
             now_ts,
         ),
     )
+    return int(cursor.lastrowid)
+
+
+def update_shared_mailbox_from_import(conn, mailbox, password, client_id, refresh_token, now_ts):
+    mailbox_id = int(mailbox["id"])
+    current_password = str(mailbox["password"] or "")
+    current_refresh_token = str(mailbox["refresh_token"] or "").strip()
+    incoming_refresh_token = str(refresh_token or "").strip()
+    incoming_password = str(password or "")
+
+    next_password = incoming_password if incoming_password else current_password
+    refresh_token_prev = mailbox["refresh_token_prev"] or ""
+    refresh_token_prev_updated_at = int(mailbox["refresh_token_prev_updated_at"] or 0)
+
+    if incoming_refresh_token and incoming_refresh_token != current_refresh_token:
+        token_state = import_token_state(client_id, incoming_refresh_token, now_ts)
+        if current_refresh_token:
+            refresh_token_prev = current_refresh_token
+            refresh_token_prev_updated_at = now_ts
+        conn.execute(
+            """
+            UPDATE mailboxes
+            SET password = ?, client_id = ?, refresh_token = ?, refresh_token_prev = ?,
+                refresh_token_prev_updated_at = ?, refresh_token_updated_at = 0,
+                access_token_cached = '', access_token_expires_at = 0,
+                refresh_token_expires_at = 0, token_status = ?, token_last_error = '',
+                token_last_error_at = 0, token_last_warning = '',
+                token_refresh_priority = ?, token_next_refresh_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_password,
+                client_id,
+                incoming_refresh_token,
+                refresh_token_prev,
+                refresh_token_prev_updated_at,
+                token_state["token_status"],
+                token_state["token_refresh_priority"],
+                token_state["token_next_refresh_at"],
+                now_ts,
+                mailbox_id,
+            ),
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE mailboxes
+        SET password = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (next_password, now_ts, mailbox_id),
+    )
+
+
+def upsert_mailbox_from_import(conn, address, password, client_id, refresh_token, owner_key, now_ts):
+    address = normalize_address(address)
+    password = str(password or "").replace("\r", " ").replace("\n", " ").strip()
+    client_id = str(client_id or "").replace("\r", " ").replace("\n", " ").strip()
+    refresh_token = str(refresh_token or "").replace("\r", " ").replace("\n", " ").strip()
+
+    existing_binding = get_user_mailbox(conn, owner_key, address)
+    if existing_binding:
+        current_client_id = str(existing_binding["client_id"] or "").strip()
+        if current_client_id != client_id:
+            return False, f"Address {address} already exists in your account with a different ClientID."
+        update_shared_mailbox_from_import(
+            conn,
+            existing_binding,
+            password,
+            client_id,
+            refresh_token,
+            now_ts,
+        )
+        return True, None
+
+    shared_mailbox = find_shared_mailbox(conn, address, client_id)
+    if shared_mailbox:
+        update_shared_mailbox_from_import(
+            conn,
+            shared_mailbox,
+            password,
+            client_id,
+            refresh_token,
+            now_ts,
+        )
+        bind_user_mailbox(conn, owner_key, shared_mailbox["id"], address, now_ts)
+        return True, None
+
+    mailbox_id = create_shared_mailbox_from_import(
+        conn,
+        address,
+        password,
+        client_id,
+        refresh_token,
+        now_ts,
+    )
+    bind_user_mailbox(conn, owner_key, mailbox_id, address, now_ts)
     return True, None
 
 
@@ -2450,18 +2799,7 @@ def index():
     current_page = max(1, current_page)
 
     with get_db() as conn:
-        if MULTI_USER:
-            total_mailboxes = int(
-                conn.execute(
-                    "SELECT COUNT(1) FROM mailboxes WHERE owner_key = ?",
-                    (user_key,),
-                ).fetchone()[0]
-            )
-        else:
-            total_mailboxes = int(
-                conn.execute("SELECT COUNT(1) FROM mailboxes").fetchone()[0]
-            )
-
+        total_mailboxes = count_user_mailboxes(conn, user_key)
         total_pages = max(1, (total_mailboxes + per_page - 1) // per_page)
         if current_page > total_pages:
             current_page = total_pages
@@ -2469,25 +2807,7 @@ def index():
         next_page = current_page + 1 if current_page < total_pages else total_pages
         offset = (current_page - 1) * per_page
 
-        if MULTI_USER:
-            mailboxes = conn.execute(
-                """
-                SELECT * FROM mailboxes
-                WHERE owner_key = ?
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (user_key, per_page, offset),
-            ).fetchall()
-        else:
-            mailboxes = conn.execute(
-                """
-                SELECT * FROM mailboxes
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (per_page, offset),
-            ).fetchall()
+        mailboxes = list_user_mailboxes(conn, user_key, limit=per_page, offset=offset)
     return render_page(
         build_page_title("page.mailboxes"),
         INDEX_TEMPLATE,
@@ -2513,24 +2833,7 @@ def export_mailboxes_txt():
     if user_key is None:
         return render_login_page("login.require_export")
     with get_db() as conn:
-        if MULTI_USER:
-            rows = conn.execute(
-                """
-                SELECT address, password, client_id, refresh_token
-                FROM mailboxes
-                WHERE owner_key = ?
-                ORDER BY created_at DESC
-                """,
-                (user_key,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT address, password, client_id, refresh_token
-                FROM mailboxes
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
+        rows = list_export_mailboxes(conn, user_key)
     payload = export_mailboxes_text(rows) + ("\n" if rows else "")
     response = APP.response_class(payload, mimetype="text/plain")
     response.headers["Content-Disposition"] = "attachment; filename=mailboxes.txt"
@@ -2663,7 +2966,7 @@ def api_auth_rotate():
             (new_key, now, now),
         )
         conn.execute(
-            "UPDATE mailboxes SET owner_key = ? WHERE owner_key = ?",
+            "UPDATE mailbox_users SET owner_key = ? WHERE owner_key = ?",
             (new_key, user_key),
         )
         conn.execute(
@@ -2680,15 +2983,7 @@ def api_list_mailboxes():
     if isinstance(user_key, tuple):
         return user_key
     with get_db() as conn:
-        if MULTI_USER:
-            mailboxes = conn.execute(
-                "SELECT * FROM mailboxes WHERE owner_key = ? ORDER BY created_at DESC",
-                (user_key,),
-            ).fetchall()
-        else:
-            mailboxes = conn.execute(
-                "SELECT * FROM mailboxes ORDER BY created_at DESC"
-            ).fetchall()
+        mailboxes = list_user_mailboxes(conn, user_key)
     payload = [row_to_dict(row) for row in mailboxes]
     return api_ok(payload)
 
@@ -2757,13 +3052,9 @@ def api_delete_mailbox(address):
     if isinstance(user_key, tuple):
         return user_key
     with get_db() as conn:
-        if MULTI_USER:
-            conn.execute(
-                "DELETE FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            )
-        else:
-            conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
+        mailbox_id = unbind_user_mailbox(conn, user_key, address)
+        if mailbox_id is not None:
+            delete_mailbox_if_unbound(conn, mailbox_id)
     return api_ok({"deleted": address})
 
 
@@ -2779,15 +3070,7 @@ def api_list_messages(address):
         limit = DEFAULT_LIMIT
     limit = max(1, min(MAX_LIMIT, limit))
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     try:
@@ -2820,15 +3103,7 @@ def api_get_message(address, uid):
     if isinstance(user_key, tuple):
         return user_key
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     folder = request.args.get("folder")
@@ -2849,15 +3124,7 @@ def api_share_message(address, uid):
     if isinstance(user_key, tuple):
         return user_key
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         return api_error("Mailbox not found.", status=404)
     folder = request.args.get("folder")
@@ -3001,13 +3268,9 @@ def delete_mailbox(address):
     if user_key is None:
         return render_login_page("login.require_delete_mailboxes")
     with get_db() as conn:
-        if MULTI_USER:
-            conn.execute(
-                "DELETE FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            )
-        else:
-            conn.execute("DELETE FROM mailboxes WHERE address = ?", (address,))
+        mailbox_id = unbind_user_mailbox(conn, user_key, address)
+        if mailbox_id is not None:
+            delete_mailbox_if_unbound(conn, mailbox_id)
     flash(tr("flash.mailbox_deleted"), "success")
     return redirect(url_for("index"))
 
@@ -3019,50 +3282,24 @@ def delete_bad_token_mailboxes():
         return render_login_page("login.require_delete_mailboxes")
     bad_statuses = ("warning", "degraded")
     with get_db() as conn:
-        if MULTI_USER:
-            count_row = conn.execute(
-                """
-                SELECT COUNT(1)
-                FROM mailboxes
-                WHERE owner_key = ?
-                  AND client_id != ''
-                  AND refresh_token != ''
-                  AND token_status IN (?, ?)
-                """,
-                (user_key, *bad_statuses),
-            ).fetchone()
-            deleted_count = int(count_row[0] or 0)
-            conn.execute(
-                """
-                DELETE FROM mailboxes
-                WHERE owner_key = ?
-                  AND client_id != ''
-                  AND refresh_token != ''
-                  AND token_status IN (?, ?)
-                """,
-                (user_key, *bad_statuses),
-            )
-        else:
-            count_row = conn.execute(
-                """
-                SELECT COUNT(1)
-                FROM mailboxes
-                WHERE client_id != ''
-                  AND refresh_token != ''
-                  AND token_status IN (?, ?)
-                """,
-                bad_statuses,
-            ).fetchone()
-            deleted_count = int(count_row[0] or 0)
-            conn.execute(
-                """
-                DELETE FROM mailboxes
-                WHERE client_id != ''
-                  AND refresh_token != ''
-                  AND token_status IN (?, ?)
-                """,
-                bad_statuses,
-            )
+        doomed = conn.execute(
+            """
+            SELECT mu.mailbox_address, mu.mailbox_id
+            FROM mailbox_users mu
+            JOIN mailboxes m ON m.id = mu.mailbox_id
+            WHERE mu.owner_key = ?
+              AND m.client_id != ''
+              AND m.refresh_token != ''
+              AND m.token_status IN (?, ?)
+            ORDER BY mu.created_at DESC, mu.id DESC
+            """,
+            (scoped_owner_key(user_key), *bad_statuses),
+        ).fetchall()
+        deleted_count = len(doomed)
+        for row in doomed:
+            mailbox_id = unbind_user_mailbox(conn, user_key, row["mailbox_address"])
+            if mailbox_id is not None:
+                delete_mailbox_if_unbound(conn, mailbox_id)
     flash(tr("flash.bad_token_mailboxes_deleted_n", n=deleted_count), "success")
     return redirect(url_for("index"))
 
@@ -3080,15 +3317,7 @@ def view_mailbox(address):
     limit = max(1, min(MAX_LIMIT, limit))
 
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         abort(404)
 
@@ -3120,15 +3349,7 @@ def view_message(address, uid):
     if user_key is None:
         return render_login_page("login.require_view_messages")
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         abort(404)
 
@@ -3158,15 +3379,7 @@ def share_message(address, uid):
     if user_key is None:
         return render_login_page("login.require_share_messages")
     with get_db() as conn:
-        if MULTI_USER:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ? AND owner_key = ?",
-                (address, user_key),
-            ).fetchone()
-        else:
-            mailbox = conn.execute(
-                "SELECT * FROM mailboxes WHERE address = ?", (address,)
-            ).fetchone()
+        mailbox = get_user_mailbox(conn, user_key, address)
     if not mailbox:
         abort(404)
 

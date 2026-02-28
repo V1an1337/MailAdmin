@@ -6,6 +6,7 @@ Multi-mailbox Outlook mail viewer with HTML previews, share links, and a JSON AP
 
 ## Features
 - Import and manage multiple mailboxes.
+- Multi-user shared mailbox bindings by `address + client_id`.
 - Merge Inbox + Junk into one list, sorted by time.
 - View message HTML safely in a sandboxed iframe.
 - Share messages via `/share/{8chars}` links.
@@ -51,6 +52,14 @@ When `MAILADMIN_MULTI_USER=1`, every user is identified by an API key:
 - API key rotation is allowed once every 24 hours.
 - Mailboxes and shares are isolated per API key.
 
+Mailbox behavior in multi-user mode:
+- Different users can import the same mailbox address.
+- If `address + client_id` is the same, users share one underlying mailbox record.
+- Shared users also share token refresh state, access token cache, token warnings, and IMAP fetch behavior.
+- If the same address is imported with a different `client_id`, it is treated as a different mailbox.
+- The same user cannot import the same address twice.
+- If the same shared mailbox is imported with a newer refresh token, the new token replaces the shared token and the old one is kept as rollback token.
+
 ## Import mailboxes
 Import format (one per line):
 ```
@@ -60,6 +69,8 @@ Address----Password----ClientID----OAuth2Token
 Notes:
 - If `ClientID` is empty, `OAuth2Token` is treated as an access token.
 - If both OAuth fields are empty, password login is used.
+- In multi-user mode, the same `address + client_id` imported by different users will bind to the same shared mailbox.
+- In multi-user mode, importing the same address again under the same user with a different `client_id` is rejected.
 
 ## Web pages
 - `/` Mailboxes
@@ -128,6 +139,11 @@ POST /api/mailboxes
 DELETE /api/mailboxes/{address}
 ```
 
+Multi-user import behavior:
+- Different users importing the same `address + client_id` share one mailbox record.
+- Different users importing the same address with different `client_id` values get separate mailbox records.
+- The same user cannot import the same address twice with different `client_id` values.
+
 `POST /api/mailboxes` accepts either:
 - JSON:
 ```json
@@ -161,3 +177,16 @@ DELETE /api/shares/{code}
 ## Notes on Junk folder
 The app queries both Inbox and Junk folders for Outlook. If your Junk
 folder name differs, add it to `JUNK_FOLDERS` in `server.py`.
+
+## Upgrade note
+This version includes an automatic SQLite schema migration for shared mailbox bindings:
+- adds a `mailbox_users` table
+- changes mailbox uniqueness from `address` to `address + client_id`
+- keeps a backup table such as `mailboxes_old` on first migration
+
+Recommended deployment steps:
+1. Stop the running server.
+2. Back up `mailadmin.db`.
+3. Replace the code.
+4. Start the server once and let the migration complete.
+5. Verify mailbox list, import, and message fetch with at least two user accounts.
