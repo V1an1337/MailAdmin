@@ -2742,12 +2742,13 @@ def api_import_mailboxes():
                 owner_errors.append(err)
                 continue
             imported += 1
-    if owner_errors:
-        for err in owner_errors[:3]:
-            flash(err, "error")
-        if len(owner_errors) > 3:
-            flash(tr("flash.more_errors_hidden", n=len(owner_errors) - 3), "error")
-    return api_ok({"imported": imported, "errors": errors})
+    return api_ok(
+        {
+            "imported": imported,
+            "errors": errors + owner_errors,
+            "owner_errors": owner_errors,
+        }
+    )
 
 
 @APP.delete("/api/mailboxes/<path:address>")
@@ -2957,17 +2958,18 @@ def import_mailboxes():
         flash(tr("flash.import_empty"), "error")
         return redirect(url_for("index"))
 
-    entries, errors = parse_import_payload(payload)
-    if errors:
-        for err in errors[:3]:
+    entries, parse_errors = parse_import_payload(payload)
+    if parse_errors:
+        for err in parse_errors[:3]:
             flash(err, "error")
-        if len(errors) > 3:
-            flash(tr("flash.more_errors_hidden", n=len(errors) - 3), "error")
+        if len(parse_errors) > 3:
+            flash(tr("flash.more_errors_hidden", n=len(parse_errors) - 3), "error")
     if not entries:
         return redirect(url_for("index"))
 
     now = int(time.time())
     imported = 0
+    owner_errors = []
     with get_db() as conn:
         for address, password, client_id, refresh_token in entries:
             ok, err = upsert_mailbox_from_import(
@@ -2980,10 +2982,16 @@ def import_mailboxes():
                 now,
             )
             if not ok:
-                errors.append(err)
+                owner_errors.append(err)
                 continue
             imported += 1
-    flash(tr("flash.imported_n", n=imported), "success")
+    if owner_errors:
+        for err in owner_errors[:3]:
+            flash(err, "error")
+        if len(owner_errors) > 3:
+            flash(tr("flash.more_errors_hidden", n=len(owner_errors) - 3), "error")
+    if imported or (not parse_errors and not owner_errors):
+        flash(tr("flash.imported_n", n=imported), "success")
     return redirect(url_for("import_page"))
 
 
